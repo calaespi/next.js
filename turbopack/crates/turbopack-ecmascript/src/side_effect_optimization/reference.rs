@@ -145,6 +145,7 @@ impl ChunkableModuleReference for EcmascriptModulePartReference {
         Vc::cell(Some(ChunkingType::Parallel {
             inherit_async: true,
             hoisted: true,
+            resolve_export: None,
         }))
     }
 

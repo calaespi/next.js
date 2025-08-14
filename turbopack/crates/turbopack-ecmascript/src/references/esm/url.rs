@@ -119,6 +119,7 @@ impl ChunkableModuleReference for UrlAssetReference {
         Vc::cell(Some(ChunkingType::Parallel {
             inherit_async: false,
             hoisted: false,
+            resolve_export: None,
         }))
     }
 }
