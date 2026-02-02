@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use either::Either;
 use itertools::Itertools;
 use turbo_rcstr::rcstr;
@@ -16,7 +16,7 @@ use turbopack_core::{
         OptionStyledString, StyledString,
     },
     module::Module,
-    resolve::{FindContextFileResult, find_context_file, package_json},
+    resolve::{FindContextFileResult, ModulePart, find_context_file, package_json},
 };
 
 use crate::references::{
@@ -31,6 +31,18 @@ pub trait EcmascriptChunkPlaceable: ChunkableModule + Module {
     #[turbo_tasks::function]
     fn get_async_module(self: Vc<Self>) -> Vc<OptionAsyncModule> {
         Vc::cell(None)
+    }
+    /// Returns a split version of this module for the given module part, or self if no
+    /// split exists.
+    #[turbo_tasks::function]
+    fn get_split(
+        self: Vc<Self>,
+        part: ModulePart,
+    ) -> Result<Vc<Box<dyn EcmascriptChunkPlaceable>>> {
+        match part {
+            ModulePart::Facade | ModulePart::Locals => Ok(self),
+            _ => bail!("Unexpected module part: {part:?}"),
+        }
     }
 }
 
