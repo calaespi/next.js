@@ -7,7 +7,7 @@ use std::{
 };
 
 use turbo_bincode::TurboBincodeBuffer;
-use turbo_tasks::{FxDashMap, TaskId, scope::scope_and_block, util::good_chunk_size};
+use turbo_tasks::{FxDashMap, TaskId, parallel, scope::scope_and_block, util::good_chunk_size};
 
 use crate::{
     backend::storage_schema::TaskStorage,
@@ -179,11 +179,11 @@ impl Storage {
     /// When items are accessed in future they will be marked as modified.
     fn end_snapshot(&self, modified_tasks: Vec<Vec<TaskId>>) {
         // Clear modified/new flags on all tasks that were in the original modified list.
-        // This must happen AFTER leaving snapshot mode to avoid race conditions where
-        // a concurrent modification sees (snapshot_mode=true, modified=false) and
-        // incorrectly skips creating a snapshot entry.
+        // This must happen WHILE STILL IN snapshot mode so that any concurrent modifications
+        // will go to the `snapshots` map (since they see snapshot_mode=true and modified=false).
+        // We'll drain the snapshots map after leaving snapshot mode.
         // Tasks that were removed or had no modifications will just have a no-op flag clear.
-        for task_ids in modified_tasks {
+        parallel::map_collect_owned::<_, _, Vec<_>>(modified_tasks, |task_ids| {
             for task_id in task_ids {
                 if let Some(mut inner) = self.map.get_mut(&task_id) {
                     inner.flags.set_data_modified(false);
@@ -191,28 +191,34 @@ impl Storage {
                     inner.flags.set_new_persistent_task(false);
                 }
             }
-        }
+        });
         // Leave snapshot mode first - any new accesses will be tracked as modified
         self.snapshot_mode.store(false, Ordering::Release);
 
         // Handle tasks that had snapshots (they were accessed during snapshot mode).
         // These need to be re-added to modified for the next cycle.
-        // Use retain with always-false predicate to drain while processing.
-        self.snapshots.retain(|&key, _| {
-            if let Some(mut inner) = self.map.get_mut(&key) {
-                // Convert snapshot flags to modified flags
-                if inner.flags.meta_snapshot() {
-                    inner.flags.set_meta_snapshot(false);
-                    inner.flags.set_meta_modified(true);
+        // Process shards in parallel, draining each shard.
+        parallel::for_each(self.snapshots.shards(), |shard| {
+            let mut guard = shard.write();
+            // Safety: guard must outlive the iterator
+            for bucket in unsafe { guard.iter() } {
+                // Safety: the guard guarantees the bucket is valid
+                let (key, _) = unsafe { bucket.as_ref() };
+                if let Some(mut inner) = self.map.get_mut(key) {
+                    // Convert snapshot flags to modified flags
+                    if inner.flags.meta_snapshot() {
+                        inner.flags.set_meta_snapshot(false);
+                        inner.flags.set_meta_modified(true);
+                    }
+                    if inner.flags.data_snapshot() {
+                        inner.flags.set_data_snapshot(false);
+                        inner.flags.set_data_modified(true);
+                    }
+                    // Re-add to modified list since they were accessed during snapshot
+                    self.modified.lock(*key).push(*key);
                 }
-                if inner.flags.data_snapshot() {
-                    inner.flags.set_data_snapshot(false);
-                    inner.flags.set_data_modified(true);
-                }
-                // Re-add to modified list since they were accessed during snapshot
-                self.modified.lock(key).push(key);
             }
-            false // Remove all entries
+            guard.clear();
         });
         self.snapshots.shrink_to_fit();
     }
