@@ -1,5 +1,4 @@
 use std::{
-    mem,
     ops::{Deref, DerefMut},
     sync::{
         Arc,
