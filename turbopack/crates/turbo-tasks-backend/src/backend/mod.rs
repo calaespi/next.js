@@ -61,20 +61,17 @@ use crate::{
         storage::Storage,
         storage_schema::{TaskStorage, TaskStorageAccessors},
     },
-    backing_storage::BackingStorage,
+    backing_storage::{BackingStorage, SnapshotItem},
     data::{
         ActivenessState, CellRef, CollectibleRef, CollectiblesRef, Dirtyness, InProgressCellState,
         InProgressState, InProgressStateInner, OutputValue, TransientTask,
     },
     utils::{
         arc_or_owned::ArcOrOwned,
-        chunked_vec::ChunkedVec,
         dash_map_drop_contents::drop_contents,
         dash_map_raw_entry::{RawEntry, raw_entry},
         ptr_eq_arc::PtrEqArc,
         shard_amount::compute_shard_amount,
-        sharded::Sharded,
-        swap_retain,
     },
 };
 
@@ -164,8 +161,6 @@ pub enum TurboTasksBackendJob {
 
 pub struct TurboTasksBackend<B: BackingStorage>(Arc<TurboTasksBackendInner<B>>);
 
-type TaskCacheLog = Sharded<ChunkedVec<(Arc<CachedTaskType>, TaskId)>>;
-
 struct TurboTasksBackendInner<B: BackingStorage> {
     options: BackendOptions,
 
@@ -174,7 +169,6 @@ struct TurboTasksBackendInner<B: BackingStorage> {
     persisted_task_id_factory: IdFactoryWithReuse<TaskId>,
     transient_task_id_factory: IdFactoryWithReuse<TaskId>,
 
-    persisted_task_cache_log: Option<TaskCacheLog>,
     task_cache: FxDashMap<Arc<CachedTaskType>, TaskId>,
 
     storage: Storage,
@@ -231,10 +225,6 @@ impl<B: BackingStorage> TurboTasksBackend<B> {
 impl<B: BackingStorage> TurboTasksBackendInner<B> {
     pub fn new(mut options: BackendOptions, backing_storage: B) -> Self {
         let shard_amount = compute_shard_amount(options.num_workers, options.small_preallocation);
-        let need_log = matches!(
-            options.storage_mode,
-            Some(StorageMode::ReadWrite) | Some(StorageMode::ReadWriteOnShutdown)
-        );
         if !options.dependency_tracking {
             options.active_tracking = false;
         }
@@ -253,7 +243,6 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                 TaskId::try_from(TRANSIENT_TASK_BIT).unwrap(),
                 TaskId::MAX,
             ),
-            persisted_task_cache_log: need_log.then(|| Sharded::new(shard_amount)),
             task_cache: FxDashMap::default(),
             local_is_partial: AtomicBool::new(next_task_id != TaskId::MIN),
             storage: Storage::new(shard_amount, small_preallocation),
@@ -991,11 +980,6 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                 .collect::<Vec<_>>();
         }
         self.storage.start_snapshot();
-        let mut persisted_task_cache_log = self
-            .persisted_task_cache_log
-            .as_ref()
-            .map(|l| l.take(|i| i))
-            .unwrap_or_default();
         let mut snapshot_request = self.snapshot_request.lock();
         snapshot_request.snapshot_requested = false;
         self.in_progress_operations
@@ -1068,7 +1052,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
 
         let preprocess = |task_id: TaskId, inner: &TaskStorage| {
             if task_id.is_transient() {
-                return (None, None);
+                return (None, None, None);
             }
 
             let meta_restored = inner.flags.meta_restored();
@@ -1078,10 +1062,22 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             let meta = meta_restored.then(|| inner.clone_meta_snapshot());
             let data = data_restored.then(|| inner.clone_data_snapshot());
 
-            (meta, data)
+            // Capture task type if this is a new task that needs cache persistence
+            let task_type = inner.flags.new_persistent_task().then(|| {
+                inner
+                    .get_persistent_task_type()
+                    .expect("new tasks must have a persistent_task_type")
+                    .clone()
+            });
+
+            (meta, data, task_type)
         };
         let process = |task_id: TaskId,
-                       (meta, data): (Option<TaskStorage>, Option<TaskStorage>),
+                       (meta, data, task_type): (
+            Option<TaskStorage>,
+            Option<TaskStorage>,
+            Option<Arc<CachedTaskType>>,
+        ),
                        buffer: &mut TurboBincodeBuffer| {
             #[cfg(feature = "print_cache_item_size")]
             if let Some(ref m) = meta {
@@ -1091,38 +1087,147 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                     .or_default()
                     .add_counts(m);
             }
-            (
+            let meta = meta.and_then(|d| {
+                match encode_task_data(task_id, &d, SpecificTaskDataCategory::Meta, buffer) {
+                    Ok(encoded) => {
+                        #[cfg(feature = "print_cache_item_size")]
+                        task_cache_stats
+                            .lock()
+                            .entry(self.debug_get_task_name(task_id))
+                            .or_default()
+                            .add_meta(&encoded);
+                        Some(encoded)
+                    }
+                    Err(err) => {
+                        println!(
+                            "Serializing task {} failed (meta): {:?}",
+                            self.debug_get_task_description(task_id),
+                            err
+                        );
+                        None
+                    }
+                }
+            });
+            let data = data.and_then(|d| {
+                match encode_task_data(task_id, &d, SpecificTaskDataCategory::Data, buffer) {
+                    Ok(encoded) => {
+                        #[cfg(feature = "print_cache_item_size")]
+                        task_cache_stats
+                            .lock()
+                            .entry(self.debug_get_task_name(task_id))
+                            .or_default()
+                            .add_data(&encoded);
+                        Some(encoded)
+                    }
+                    Err(err) => {
+                        println!(
+                            "Serializing task {} failed (data): {:?}",
+                            self.debug_get_task_description(task_id),
+                            err
+                        );
+                        None
+                    }
+                }
+            });
+            SnapshotItem {
                 task_id,
-                meta.map(|d| encode_task_data(task_id, &d, SpecificTaskDataCategory::Meta, buffer)),
-                data.map(|d| encode_task_data(task_id, &d, SpecificTaskDataCategory::Data, buffer)),
-            )
+                meta,
+                data,
+                task_type,
+            }
         };
-        let process_snapshot =
-            |task_id: TaskId, inner: Box<TaskStorage>, buffer: &mut TurboBincodeBuffer| {
-                if task_id.is_transient() {
-                    return (task_id, None, None);
-                }
-
-                #[cfg(feature = "print_cache_item_size")]
-                if inner.flags.meta_modified() {
-                    task_cache_stats
-                        .lock()
-                        .entry(self.debug_get_task_name(task_id))
-                        .or_default()
-                        .add_counts(&inner);
-                }
-
-                // Encode meta/data directly from TaskStorage snapshot
-                (
+        let process_snapshot = |task_id: TaskId,
+                                inner: Box<TaskStorage>,
+                                buffer: &mut TurboBincodeBuffer| {
+            if task_id.is_transient() {
+                return SnapshotItem {
                     task_id,
-                    inner.flags.meta_modified().then(|| {
-                        encode_task_data(task_id, &inner, SpecificTaskDataCategory::Meta, buffer)
-                    }),
-                    inner.flags.data_modified().then(|| {
-                        encode_task_data(task_id, &inner, SpecificTaskDataCategory::Data, buffer)
-                    }),
-                )
-            };
+                    meta: None,
+                    data: None,
+                    task_type: None,
+                };
+            }
+
+            #[cfg(feature = "print_cache_item_size")]
+            if inner.flags.meta_modified() {
+                task_cache_stats
+                    .lock()
+                    .entry(self.debug_get_task_name(task_id))
+                    .or_default()
+                    .add_counts(&inner);
+            }
+
+            // Capture task type if this is a new task (from snapshot's modified flags)
+            let task_type = inner.flags.new_persistent_task().then(|| {
+                inner
+                    .get_persistent_task_type()
+                    .expect(
+                        "new_persistent_task can only be set if there is a persistent_task_type",
+                    )
+                    .clone()
+            });
+
+            // Encode meta/data directly from TaskStorage snapshot
+            let meta = inner
+                .flags
+                .meta_modified()
+                .then(|| {
+                    match encode_task_data(task_id, &inner, SpecificTaskDataCategory::Meta, buffer)
+                    {
+                        Ok(encoded) => {
+                            #[cfg(feature = "print_cache_item_size")]
+                            task_cache_stats
+                                .lock()
+                                .entry(self.debug_get_task_name(task_id))
+                                .or_default()
+                                .add_meta(&encoded);
+                            Some(encoded)
+                        }
+                        Err(err) => {
+                            println!(
+                                "Serializing task {} failed (meta): {:?}",
+                                self.debug_get_task_description(task_id),
+                                err
+                            );
+                            None
+                        }
+                    }
+                })
+                .flatten();
+            let data = inner
+                .flags
+                .data_modified()
+                .then(|| {
+                    match encode_task_data(task_id, &inner, SpecificTaskDataCategory::Data, buffer)
+                    {
+                        Ok(encoded) => {
+                            #[cfg(feature = "print_cache_item_size")]
+                            task_cache_stats
+                                .lock()
+                                .entry(self.debug_get_task_name(task_id))
+                                .or_default()
+                                .add_data(&encoded);
+                            Some(encoded)
+                        }
+                        Err(err) => {
+                            println!(
+                                "Serializing task {} failed (data): {:?}",
+                                self.debug_get_task_description(task_id),
+                                err
+                            );
+                            None
+                        }
+                    }
+                })
+                .flatten();
+
+            SnapshotItem {
+                task_id,
+                meta,
+                data,
+                task_type,
+            }
+        };
 
         let snapshot = self
             .storage
@@ -1132,75 +1237,26 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             .into_iter()
             .filter_map(|iter| {
                 let mut iter = iter
-                    .filter_map(
-                        |(task_id, meta, data): (
-                            _,
-                            Option<Result<SmallVec<_>>>,
-                            Option<Result<SmallVec<_>>>,
-                        )| {
-                            let meta = match meta {
-                                Some(Ok(meta)) => {
-                                    #[cfg(feature = "print_cache_item_size")]
-                                    task_cache_stats
-                                        .lock()
-                                        .entry(self.debug_get_task_name(task_id))
-                                        .or_default()
-                                        .add_meta(&meta);
-                                    Some(meta)
-                                }
-                                None => None,
-                                Some(Err(err)) => {
-                                    println!(
-                                        "Serializing task {} failed (meta): {:?}",
-                                        self.debug_get_task_description(task_id),
-                                        err
-                                    );
-                                    None
-                                }
-                            };
-                            let data = match data {
-                                Some(Ok(data)) => {
-                                    #[cfg(feature = "print_cache_item_size")]
-                                    task_cache_stats
-                                        .lock()
-                                        .entry(self.debug_get_task_name(task_id))
-                                        .or_default()
-                                        .add_data(&data);
-                                    Some(data)
-                                }
-                                None => None,
-                                Some(Err(err)) => {
-                                    println!(
-                                        "Serializing task {} failed (data): {:?}",
-                                        self.debug_get_task_description(task_id),
-                                        err
-                                    );
-                                    None
-                                }
-                            };
-                            (meta.is_some() || data.is_some()).then_some((task_id, meta, data))
-                        },
-                    )
+                    .filter(|item| {
+                        item.meta.is_some() || item.data.is_some() || item.task_type.is_some()
+                    })
                     .peekable();
                 iter.peek().is_some().then_some(iter)
             })
             .collect::<Vec<_>>();
 
-        swap_retain(&mut persisted_task_cache_log, |shard| !shard.is_empty());
-
         drop(snapshot_span);
 
-        if persisted_task_cache_log.is_empty() && task_snapshots.is_empty() {
+        if task_snapshots.is_empty() {
             return Some((snapshot_time, false));
         }
 
         let _span = tracing::info_span!(parent: parent_span, "persist", reason = reason).entered();
         {
-            if let Err(err) = self.backing_storage.save_snapshot(
-                suspended_operations,
-                persisted_task_cache_log,
-                task_snapshots,
-            ) {
+            if let Err(err) = self
+                .backing_storage
+                .save_snapshot(suspended_operations, task_snapshots)
+            {
                 println!("Persisting failed: {err:?}");
                 return None;
             }
@@ -1459,7 +1515,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             } else {
                 // Task doesn't exist in memory cache or backing storage
                 // So we might need to create a new task
-                let (task_id, mut task_type) = match raw_entry(&self.task_cache, &task_type) {
+                let (task_id, task_type) = match raw_entry(&self.task_cache, &task_type) {
                     RawEntry::Occupied(e) => {
                         let task_id = *e.get();
                         drop(e);
@@ -1474,11 +1530,6 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                         (task_id, ArcOrOwned::Arc(task_type))
                     }
                 };
-                if let Some(log) = &self.persisted_task_cache_log {
-                    let task_type_arc: Arc<CachedTaskType> = Arc::from(task_type);
-                    log.lock(task_id).push((task_type_arc.clone(), task_id));
-                    task_type = ArcOrOwned::Arc(task_type_arc);
-                }
                 (task_id, task_type)
             }
         };

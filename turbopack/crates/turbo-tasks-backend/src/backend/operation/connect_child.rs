@@ -86,6 +86,7 @@ impl ConnectChildOperation {
                 && !child_task.has_persistent_task_type()
             {
                 child_task.set_persistent_task_type(child_task_type.into());
+                child_task.set_new_persistent_task(true);
             }
 
             if !child_task.has_output()
