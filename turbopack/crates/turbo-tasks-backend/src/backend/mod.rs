@@ -1050,6 +1050,37 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         let task_cache_stats: Mutex<FxHashMap<_, TaskCacheStats>> =
             Mutex::new(FxHashMap::default());
 
+        // Helper to encode task data and handle errors/stats
+        let encode_category = |task_id: TaskId,
+                               data: &TaskStorage,
+                               category: SpecificTaskDataCategory,
+                               buffer: &mut TurboBincodeBuffer|
+         -> Option<TurboBincodeBuffer> {
+            match encode_task_data(task_id, data, category, buffer) {
+                Ok(encoded) => {
+                    #[cfg(feature = "print_cache_item_size")]
+                    {
+                        let mut stats = task_cache_stats.lock();
+                        let entry = stats.entry(self.debug_get_task_name(task_id)).or_default();
+                        match category {
+                            SpecificTaskDataCategory::Meta => entry.add_meta(&encoded),
+                            SpecificTaskDataCategory::Data => entry.add_data(&encoded),
+                        }
+                    }
+                    Some(encoded)
+                }
+                Err(err) => {
+                    println!(
+                        "Serializing task {} failed ({:?}): {:?}",
+                        self.debug_get_task_description(task_id),
+                        category,
+                        err
+                    );
+                    None
+                }
+            }
+        };
+
         let preprocess = |task_id: TaskId, inner: &TaskStorage| {
             if task_id.is_transient() {
                 return (None, None, None);
@@ -1087,48 +1118,10 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                     .or_default()
                     .add_counts(m);
             }
-            let meta = meta.and_then(|d| {
-                match encode_task_data(task_id, &d, SpecificTaskDataCategory::Meta, buffer) {
-                    Ok(encoded) => {
-                        #[cfg(feature = "print_cache_item_size")]
-                        task_cache_stats
-                            .lock()
-                            .entry(self.debug_get_task_name(task_id))
-                            .or_default()
-                            .add_meta(&encoded);
-                        Some(encoded)
-                    }
-                    Err(err) => {
-                        println!(
-                            "Serializing task {} failed (meta): {:?}",
-                            self.debug_get_task_description(task_id),
-                            err
-                        );
-                        None
-                    }
-                }
-            });
-            let data = data.and_then(|d| {
-                match encode_task_data(task_id, &d, SpecificTaskDataCategory::Data, buffer) {
-                    Ok(encoded) => {
-                        #[cfg(feature = "print_cache_item_size")]
-                        task_cache_stats
-                            .lock()
-                            .entry(self.debug_get_task_name(task_id))
-                            .or_default()
-                            .add_data(&encoded);
-                        Some(encoded)
-                    }
-                    Err(err) => {
-                        println!(
-                            "Serializing task {} failed (data): {:?}",
-                            self.debug_get_task_description(task_id),
-                            err
-                        );
-                        None
-                    }
-                }
-            });
+            let meta = meta
+                .and_then(|d| encode_category(task_id, &d, SpecificTaskDataCategory::Meta, buffer));
+            let data = data
+                .and_then(|d| encode_category(task_id, &d, SpecificTaskDataCategory::Data, buffer));
             SnapshotItem {
                 task_id,
                 meta,
@@ -1171,54 +1164,12 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             let meta = inner
                 .flags
                 .meta_modified()
-                .then(|| {
-                    match encode_task_data(task_id, &inner, SpecificTaskDataCategory::Meta, buffer)
-                    {
-                        Ok(encoded) => {
-                            #[cfg(feature = "print_cache_item_size")]
-                            task_cache_stats
-                                .lock()
-                                .entry(self.debug_get_task_name(task_id))
-                                .or_default()
-                                .add_meta(&encoded);
-                            Some(encoded)
-                        }
-                        Err(err) => {
-                            println!(
-                                "Serializing task {} failed (meta): {:?}",
-                                self.debug_get_task_description(task_id),
-                                err
-                            );
-                            None
-                        }
-                    }
-                })
+                .then(|| encode_category(task_id, &inner, SpecificTaskDataCategory::Meta, buffer))
                 .flatten();
             let data = inner
                 .flags
                 .data_modified()
-                .then(|| {
-                    match encode_task_data(task_id, &inner, SpecificTaskDataCategory::Data, buffer)
-                    {
-                        Ok(encoded) => {
-                            #[cfg(feature = "print_cache_item_size")]
-                            task_cache_stats
-                                .lock()
-                                .entry(self.debug_get_task_name(task_id))
-                                .or_default()
-                                .add_data(&encoded);
-                            Some(encoded)
-                        }
-                        Err(err) => {
-                            println!(
-                                "Serializing task {} failed (data): {:?}",
-                                self.debug_get_task_description(task_id),
-                                err
-                            );
-                            None
-                        }
-                    }
-                })
+                .then(|| encode_category(task_id, &inner, SpecificTaskDataCategory::Data, buffer))
                 .flatten();
 
             SnapshotItem {
