@@ -128,6 +128,11 @@ impl Storage {
             self.start_snapshot();
         }
 
+        // Ideally these shards would be perfectly aligned with the dashmap so we could
+        // monolithically lock shards instead of axquiring a lock for each item.  But doing this
+        // would be pretty expensive.  If somehow lock acquisition costs become large we could
+        // revisit.
+
         // Take all modified task IDs from the sharded Vecs
         let modified_shards: Vec<Vec<TaskId>> = self.modified.take(|vec| vec);
         let num_shards = modified_shards.len();
@@ -403,10 +408,15 @@ where
                 };
 
                 // Check if this task has a snapshot stored (it was accessed during snapshot mode)
-                if let Some((_, Some(snapshot))) = self.storage.snapshots.remove(&task_id) {
+                // Use get_mut + take instead of remove so the entry stays in the map.
+                // end_snapshot needs to see these entries to re-add them to modified.
+                if let Some(snapshot) = self
+                    .storage
+                    .snapshots
+                    .get_mut(&task_id)
+                    .and_then(|mut e| e.take())
+                {
                     drop(inner);
-                    // Note: tasks with snapshots don't need flag clearing - they were
-                    // already handled and will be re-added to modified in end_snapshot
                     return Some((self.process_snapshot)(
                         task_id,
                         snapshot,
