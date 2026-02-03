@@ -2,8 +2,9 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
+    thread,
 };
 
 use turbo_bincode::TurboBincodeBuffer;
@@ -66,8 +67,36 @@ impl SpecificTaskDataCategory {
 /// 2. We want to minimize fixed overhead from sharding
 const SNAPSHOT_SHARDS: usize = 16;
 
+/// Snapshot mode state machine:
+/// - `Inactive`: Not snapshotting. Modifications go to modified list.
+/// - `Active`: Actively snapshotting. Modifications go to snapshots map.
+/// - `Completing`: Snapshot done, end_snapshot is cleaning up. Modifications go to modified list,
+///   but new snapshot can't start yet (must wait for cleanup to finish).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotMode {
+    /// Default, not persisting
+    Inactive = 0,
+    /// Actively serializing to disk
+    Active = 1,
+    /// Serialization is done, datastructures are being reconciled.
+    /// This state is necessary to enable safely clearing the snapshot map
+    Completing = 2,
+}
+
+impl SnapshotMode {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => SnapshotMode::Inactive,
+            1 => SnapshotMode::Active,
+            2 => SnapshotMode::Completing,
+            _ => unreachable!("Invalid SnapshotMode value"),
+        }
+    }
+}
+
 pub struct Storage {
-    snapshot_mode: AtomicBool,
+    snapshot_mode: AtomicU8,
     /// Tracks TaskIds that have been modified since the last snapshot.
     /// Uses a sharded Vec for efficient append-only writes.
     /// Writes are guarded by the `any_modified` flag on TaskStorage, ensuring single-write
@@ -91,7 +120,7 @@ impl Storage {
         };
 
         Self {
-            snapshot_mode: AtomicBool::new(false),
+            snapshot_mode: AtomicU8::new(SnapshotMode::Inactive as u8),
             modified: Sharded::new(shard_amount),
             snapshots: FxDashMap::with_capacity_and_hasher_and_shard_amount(
                 0, // Start empty, rarely used
@@ -173,9 +202,38 @@ impl Storage {
         .collect()
     }
 
-    /// Start snapshot mode.
+    /// Start snapshot mode. Spins if a previous snapshot is still completing.
     pub fn start_snapshot(&self) {
-        self.snapshot_mode.store(true, Ordering::Release);
+        loop {
+            match SnapshotMode::from_u8(self.snapshot_mode.load(Ordering::Acquire)) {
+                SnapshotMode::Inactive => {
+                    // Try to transition Inactive -> Active
+                    if self
+                        .snapshot_mode
+                        .compare_exchange(
+                            SnapshotMode::Inactive as u8,
+                            SnapshotMode::Active as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                    // CAS failed, retry
+                }
+                SnapshotMode::Active => {
+                    // Already in snapshot mode, nothing to do
+                    return;
+                }
+                SnapshotMode::Completing => {
+                    // Previous snapshot is cleaning up, yield to OS scheduler.
+                    // This should basically never happen in practice, but prevents state
+                    // corruption if it somehow does.
+                    thread::yield_now();
+                }
+            }
+        }
     }
 
     /// End snapshot mode.
@@ -197,12 +255,15 @@ impl Storage {
                 }
             }
         });
-        // Leave snapshot mode first - any new accesses will be tracked as modified
-        self.snapshot_mode.store(false, Ordering::Release);
+        // Transition to Completing - modifications now go to modified list,
+        // but new snapshots can't start yet
+        self.snapshot_mode
+            .store(SnapshotMode::Completing as u8, Ordering::Release);
 
         // Handle tasks that had snapshots (they were accessed during snapshot mode).
         // These need to be re-added to modified for the next cycle.
         // Process shards in parallel, draining each shard.
+        // Safety: Holding map.get_mut() prevents concurrent track_modification for the same task.
         parallel::for_each(self.snapshots.shards(), |shard| {
             let mut guard = shard.write();
             // Safety: guard must outlive the iterator
@@ -226,10 +287,16 @@ impl Storage {
             guard.clear();
         });
         self.snapshots.shrink_to_fit();
+
+        // Finally transition to Inactive - new snapshots can start
+        self.snapshot_mode
+            .store(SnapshotMode::Inactive as u8, Ordering::Release);
     }
 
+    /// Returns true if actively snapshotting (modifications should go to snapshots map).
+    /// Returns false if Inactive or Completing (modifications go to modified list).
     fn snapshot_mode(&self) -> bool {
-        self.snapshot_mode.load(Ordering::Acquire)
+        SnapshotMode::from_u8(self.snapshot_mode.load(Ordering::Acquire)) == SnapshotMode::Active
     }
 
     pub fn access_mut(&self, key: TaskId) -> StorageWriteGuard<'_> {
