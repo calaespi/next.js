@@ -11,18 +11,56 @@ use turbo_tasks::{
     trace::TraceRawVcs,
 };
 use turbopack_core::{
-    chunk::ChunkingType, module::Module, reference::primary_chunkable_referenced_modules,
+    boundary::BoundaryInfo, chunk::ChunkingType, module::Module,
+    reference::primary_chunkable_referenced_modules,
 };
 use turbopack_css::chunk::CssChunkPlaceable;
 
 use crate::{
-    next_client_reference::{
-        CssClientReferenceModule,
-        ecmascript_client_reference::ecmascript_client_reference_module::EcmascriptClientReferenceModule,
+    boundary_types::{
+        boundary_type_client_reference, boundary_type_css_client_reference,
+        boundary_type_server_component, boundary_type_server_utility,
     },
-    next_server_component::server_component_module::NextServerComponentModule,
-    next_server_utility::server_utility_module::NextServerUtilityModule,
+    next_client_reference::ecmascript_client_reference::ecmascript_client_reference_module::EcmascriptClientReferenceModule,
 };
+
+/// Entry for a server component with its boundary metadata.
+#[derive(
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Hash,
+    Debug,
+    ValueDebugFormat,
+    TraceRawVcs,
+    NonLocalValue,
+    Encode,
+    Decode,
+)]
+pub struct ServerComponentEntry {
+    pub module: ResolvedVc<Box<dyn Module>>,
+    /// Boundary info containing source path and other metadata.
+    pub boundary: ResolvedVc<BoundaryInfo>,
+}
+
+/// Entry for a server utility with its boundary metadata.
+#[derive(
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Hash,
+    Debug,
+    ValueDebugFormat,
+    TraceRawVcs,
+    NonLocalValue,
+    Encode,
+    Decode,
+)]
+pub struct ServerUtilEntry {
+    pub module: ResolvedVc<Box<dyn Module>>,
+}
 
 #[derive(
     Copy,
@@ -38,7 +76,9 @@ use crate::{
     Decode,
 )]
 pub struct ClientReference {
-    pub server_component: Option<ResolvedVc<NextServerComponentModule>>,
+    /// The server component entry that owns this client reference, if any.
+    /// This links the client reference to its parent server component for grouping.
+    pub server_component: Option<ServerComponentEntry>,
     pub ty: ClientReferenceType,
 }
 
@@ -64,15 +104,15 @@ pub enum ClientReferenceType {
 #[derive(Clone, Debug, Default)]
 pub struct ClientReferenceGraphResult {
     pub client_references: Vec<ClientReference>,
-    pub server_component_entries: Vec<ResolvedVc<NextServerComponentModule>>,
-    pub server_utils: Vec<ResolvedVc<NextServerUtilityModule>>,
+    pub server_component_entries: Vec<ServerComponentEntry>,
+    pub server_utils: Vec<ServerUtilEntry>,
 }
 
 #[turbo_tasks::value(shared)]
 #[derive(Clone, Debug)]
 pub struct ServerEntries {
-    pub server_component_entries: Vec<ResolvedVc<NextServerComponentModule>>,
-    pub server_utils: Vec<ResolvedVc<NextServerUtilityModule>>,
+    pub server_component_entries: Vec<ServerComponentEntry>,
+    pub server_utils: Vec<ServerUtilEntry>,
 }
 
 /// For a given RSC entry, finds all server components (i.e. layout segments) and server utils that
@@ -140,11 +180,8 @@ struct FindServerEntries {
 #[derive(Clone, Eq, PartialEq, Hash, Debug, ValueDebugFormat, TraceRawVcs, NonLocalValue)]
 enum FindServerEntriesNode {
     ClientReference,
-    ServerComponentEntry(
-        ResolvedVc<NextServerComponentModule>,
-        Option<ReadRef<RcStr>>,
-    ),
-    ServerUtilEntry(ResolvedVc<NextServerUtilityModule>, Option<ReadRef<RcStr>>),
+    ServerComponentEntry(ServerComponentEntry, Option<ReadRef<RcStr>>),
+    ServerUtilEntry(ServerUtilEntry, Option<ReadRef<RcStr>>),
     Internal(ResolvedVc<Box<dyn Module>>, Option<ReadRef<RcStr>>),
 }
 
@@ -170,9 +207,9 @@ impl Visit<FindServerEntriesNode> for FindServerEntries {
             FindServerEntriesNode::ClientReference => {
                 unreachable!("ClientReference node should not be visited")
             }
-            FindServerEntriesNode::Internal(module, _) => **module,
-            FindServerEntriesNode::ServerUtilEntry(module, _) => Vc::upcast(**module),
-            FindServerEntriesNode::ServerComponentEntry(module, _) => Vc::upcast(**module),
+            FindServerEntriesNode::Internal(module, _) => *module,
+            FindServerEntriesNode::ServerUtilEntry(entry, _) => entry.module,
+            FindServerEntriesNode::ServerComponentEntry(entry, _) => entry.module,
         };
         let emit_spans = self.emit_spans;
         async move {
@@ -180,7 +217,7 @@ impl Visit<FindServerEntriesNode> for FindServerEntries {
             // `primary_chunkable_referenced_modules` task result, but the traced references will be
             // filtered out again afterwards.
             let referenced_modules = primary_chunkable_referenced_modules(
-                parent_module,
+                *parent_module,
                 include_traced,
                 include_binding_usage,
             )
@@ -193,54 +230,58 @@ impl Visit<FindServerEntriesNode> for FindServerEntries {
                     _ => Some(resolved.modules.iter()),
                 })
                 .flatten()
-                .map(async |module| {
-                    if ResolvedVc::try_downcast_type::<EcmascriptClientReferenceModule>(*module)
-                        .is_some()
-                        || ResolvedVc::try_downcast_type::<CssClientReferenceModule>(*module)
-                            .is_some()
-                    {
-                        return Ok((FindServerEntriesNode::ClientReference, ()));
-                    }
+                .map(async |resolved_module| {
+                    let module = resolved_module.module;
 
-                    if let Some(server_component_asset) =
-                        ResolvedVc::try_downcast_type::<NextServerComponentModule>(*module)
-                    {
-                        return Ok((
-                            FindServerEntriesNode::ServerComponentEntry(
-                                server_component_asset,
-                                if emit_spans {
-                                    // INVALIDATION: we don't need to invalidate when the span name
-                                    // changes
-                                    Some(server_component_asset.ident_string().untracked().await?)
-                                } else {
-                                    None
-                                },
-                            ),
-                            (),
-                        ));
-                    }
+                    // Check boundary info (from transitions)
+                    if let Some(boundary) = &resolved_module.boundary {
+                        let boundary_info = boundary.await?;
+                        let boundary_type = &boundary_info.boundary_type;
 
-                    if let Some(server_util_module) =
-                        ResolvedVc::try_downcast_type::<NextServerUtilityModule>(*module)
-                    {
-                        return Ok((
-                            FindServerEntriesNode::ServerUtilEntry(
-                                server_util_module,
-                                if emit_spans {
-                                    // INVALIDATION: we don't need to invalidate when the span name
-                                    // changes
-                                    Some(module.ident_string().untracked().await?)
-                                } else {
-                                    None
-                                },
-                            ),
-                            (),
-                        ));
+                        // Check for client reference boundaries
+                        if *boundary_type == boundary_type_client_reference()
+                            || *boundary_type == boundary_type_css_client_reference()
+                        {
+                            return Ok((FindServerEntriesNode::ClientReference, ()));
+                        }
+
+                        // Check for server component boundary
+                        if *boundary_type == boundary_type_server_component() {
+                            return Ok((
+                                FindServerEntriesNode::ServerComponentEntry(
+                                    ServerComponentEntry {
+                                        module,
+                                        boundary: *boundary,
+                                    },
+                                    if emit_spans {
+                                        Some(module.ident_string().untracked().await?)
+                                    } else {
+                                        None
+                                    },
+                                ),
+                                (),
+                            ));
+                        }
+
+                        // Check for server utility boundary
+                        if *boundary_type == boundary_type_server_utility() {
+                            return Ok((
+                                FindServerEntriesNode::ServerUtilEntry(
+                                    ServerUtilEntry { module },
+                                    if emit_spans {
+                                        Some(module.ident_string().untracked().await?)
+                                    } else {
+                                        None
+                                    },
+                                ),
+                                (),
+                            ));
+                        }
                     }
 
                     Ok((
                         FindServerEntriesNode::Internal(
-                            *module,
+                            module,
                             if emit_spans {
                                 // INVALIDATION: we don't need to invalidate when the span name
                                 // changes

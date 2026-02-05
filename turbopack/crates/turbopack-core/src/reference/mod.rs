@@ -9,6 +9,7 @@ use turbo_tasks::{
 };
 
 use crate::{
+    boundary::BoundaryInfo,
     chunk::{ChunkableModuleReference, ChunkingType, ChunkingTypeOption},
     module::{Module, Modules},
     output::{
@@ -293,11 +294,21 @@ pub async fn primary_referenced_modules(module: Vc<Box<dyn Module>>) -> Result<V
     Ok(Vc::cell(modules))
 }
 
+/// A resolved module with optional boundary metadata.
+#[derive(
+    Clone, Eq, PartialEq, Hash, ValueDebugFormat, TraceRawVcs, NonLocalValue, Encode, Decode,
+)]
+pub struct ResolvedModule {
+    pub module: ResolvedVc<Box<dyn Module>>,
+    /// Boundary info if this module crossing represents a boundary (e.g., server component).
+    pub boundary: Option<ResolvedVc<BoundaryInfo>>,
+}
+
 #[derive(Clone, Eq, PartialEq, ValueDebugFormat, TraceRawVcs, NonLocalValue, Encode, Decode)]
 pub struct ResolvedReference {
     pub chunking_type: ChunkingType,
     pub binding_usage: BindingUsage,
-    pub modules: Vec<ResolvedVc<Box<dyn Module>>>,
+    pub modules: Vec<ResolvedModule>,
 }
 
 #[turbo_tasks::value(transparent)]
@@ -330,7 +341,7 @@ pub async fn primary_chunkable_referenced_modules(
                 let resolved = reference
                     .resolve_reference()
                     .await?
-                    .primary_modules_ref()
+                    .primary_modules_with_boundary_ref()
                     .await?;
                 let binding_usage = if include_binding_usage {
                     reference.binding_usage().owned().await?
@@ -343,7 +354,10 @@ pub async fn primary_chunkable_referenced_modules(
                     ResolvedReference {
                         chunking_type: chunking_type.clone(),
                         binding_usage,
-                        modules: resolved,
+                        modules: resolved
+                            .into_iter()
+                            .map(|(module, boundary)| ResolvedModule { module, boundary })
+                            .collect(),
                     },
                 )));
             }

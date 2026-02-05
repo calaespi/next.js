@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use turbo_tasks::{ResolvedVc, Vc};
 use turbopack::{ModuleAssetContext, transition::Transition};
 use turbopack_core::{
+    boundary::BoundaryInfo,
     context::ProcessResult,
     file_source::FileSource,
     reference_type::{EcmaScriptModulesReferenceSubType, EntryReferenceSubType, ReferenceType},
@@ -9,7 +10,10 @@ use turbopack_core::{
 };
 use turbopack_ecmascript::chunk::EcmascriptChunkPlaceable;
 
-use crate::next_client_reference::ecmascript_client_reference::ecmascript_client_reference_module::EcmascriptClientReferenceModule;
+use crate::{
+    boundary_types::boundary_type_client_reference,
+    next_client_reference::ecmascript_client_reference::ecmascript_client_reference_module::EcmascriptClientReferenceModule,
+};
 
 #[turbo_tasks::value(shared)]
 pub struct NextEcmascriptClientReferenceTransition {
@@ -77,7 +81,11 @@ impl Transition for NextEcmascriptClientReferenceTransition {
             module_asset_context,
             ReferenceType::Entry(EntryReferenceSubType::AppClientComponent),
         );
-        let ProcessResult::Module(client_module) = *client_module.await? else {
+        let ProcessResult::Module {
+            module: client_module,
+            ..
+        } = *client_module.await?
+        else {
             return Ok(ProcessResult::Ignore.cell());
         };
 
@@ -87,7 +95,10 @@ impl Transition for NextEcmascriptClientReferenceTransition {
             ReferenceType::Entry(EntryReferenceSubType::AppClientComponent),
         );
 
-        let ProcessResult::Module(ssr_module) = *ssr_module.await? else {
+        let ProcessResult::Module {
+            module: ssr_module, ..
+        } = *ssr_module.await?
+        else {
             return Ok(ProcessResult::Ignore.cell());
         };
 
@@ -114,16 +125,19 @@ impl Transition for NextEcmascriptClientReferenceTransition {
             module_asset_context.layer.clone(),
         );
 
-        Ok(ProcessResult::Module(ResolvedVc::upcast(
-            EcmascriptClientReferenceModule::new(
-                ident,
-                Vc::upcast(server_context),
-                *client_module,
-                *ssr_module,
-            )
-            .to_resolved()
-            .await?,
-        ))
+        Ok(ProcessResult::Module {
+            module: ResolvedVc::upcast(
+                EcmascriptClientReferenceModule::new(
+                    ident,
+                    Vc::upcast(server_context),
+                    *client_module,
+                    *ssr_module,
+                )
+                .to_resolved()
+                .await?,
+            ),
+            boundary: Some(BoundaryInfo::new(boundary_type_client_reference()).resolved_cell()),
+        }
         .cell())
     }
 }

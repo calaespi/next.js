@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use turbo_tasks::{ResolvedVc, Vc};
 use turbopack::{ModuleAssetContext, transition::Transition};
-use turbopack_core::{context::ProcessResult, reference_type::ReferenceType, source::Source};
+use turbopack_core::{
+    boundary::BoundaryInfo, context::ProcessResult, reference_type::ReferenceType, source::Source,
+};
 use turbopack_css::chunk::CssChunkPlaceable;
 
-use crate::next_client_reference::css_client_reference::css_client_reference_module::CssClientReferenceModule;
+use crate::{
+    boundary_types::boundary_type_css_client_reference,
+    next_client_reference::css_client_reference::css_client_reference_module::CssClientReferenceModule,
+};
 
 #[turbo_tasks::value(shared)]
 pub struct NextCssClientReferenceTransition {
@@ -33,18 +38,21 @@ impl Transition for NextCssClientReferenceTransition {
                 .client_transition
                 .process(source, rsc_module_asset_context, reference_type);
 
-        let ProcessResult::Module(module) = *module.await? else {
+        let ProcessResult::Module { module, .. } = *module.await? else {
             return Ok(ProcessResult::Ignore.cell());
         };
 
         let client_module = ResolvedVc::try_sidecast::<Box<dyn CssChunkPlaceable>>(module)
             .context("css client asset is not css chunk placeable")?;
 
-        Ok(ProcessResult::Module(ResolvedVc::upcast(
-            CssClientReferenceModule::new(*client_module)
-                .to_resolved()
-                .await?,
-        ))
+        Ok(ProcessResult::Module {
+            module: ResolvedVc::upcast(
+                CssClientReferenceModule::new(*client_module)
+                    .to_resolved()
+                    .await?,
+            ),
+            boundary: Some(BoundaryInfo::new(boundary_type_css_client_reference()).resolved_cell()),
+        }
         .cell())
     }
 }

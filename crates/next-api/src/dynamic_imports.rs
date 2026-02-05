@@ -22,8 +22,8 @@
 use anyhow::{Context, Result};
 use bincode::{Decode, Encode};
 use next_core::{
-    next_app::ClientReferencesChunks, next_client_reference::EcmascriptClientReferenceModule,
-    next_dynamic::NextDynamicEntryModule,
+    boundary_types::boundary_type_dynamic_entry, next_app::ClientReferencesChunks,
+    next_client_reference::EcmascriptClientReferenceModule,
 };
 use turbo_tasks::{
     FxIndexMap, NonLocalValue, ReadRef, ResolvedVc, TryFlatJoinIterExt, TryJoinIterExt, Vc,
@@ -55,7 +55,10 @@ pub(crate) async fn collect_next_dynamic_chunks(
     let dynamic_import_chunks = dynamic_import_entries
         .iter()
         .map(|(dynamic_entry, parent_client_reference)| async move {
-            let module = ResolvedVc::upcast::<Box<dyn ChunkableModule>>(*dynamic_entry);
+            let Some(module) = ResolvedVc::try_sidecast::<Box<dyn ChunkableModule>>(*dynamic_entry)
+            else {
+                anyhow::bail!("dynamic entry is not a chunkable module");
+            };
 
             // This is the availability info for the parent chunk group, i.e. the client reference
             // containing the next/dynamic imports
@@ -96,9 +99,9 @@ pub(crate) async fn collect_next_dynamic_chunks(
 pub struct DynamicImportedChunks(
     #[bincode(with = "turbo_bincode::indexmap")]
     pub  FxIndexMap<
-        ResolvedVc<NextDynamicEntryModule>,
+        ResolvedVc<Box<dyn Module>>,
         (
-            ResolvedVc<NextDynamicEntryModule>,
+            ResolvedVc<Box<dyn Module>>,
             ResolvedVc<OutputAssetsWithReferenced>,
         ),
     >,
@@ -106,7 +109,7 @@ pub struct DynamicImportedChunks(
 
 #[derive(Clone, PartialEq, Eq, ValueDebugFormat, TraceRawVcs, NonLocalValue, Encode, Decode)]
 pub enum DynamicImportEntriesMapType {
-    DynamicEntry(ResolvedVc<NextDynamicEntryModule>),
+    DynamicEntry(ResolvedVc<Box<dyn Module>>),
     ClientReference(ResolvedVc<EcmascriptClientReferenceModule>),
 }
 
@@ -122,22 +125,24 @@ pub async fn map_next_dynamic(
 ) -> Result<Vc<DynamicImportEntries>> {
     let actions = graph
         .await?
-        .iter_nodes()
-        .map(|module| async move {
-            if module
-                .ident()
-                .await?
-                .layer
-                .as_ref()
-                .is_some_and(|layer| layer.name() == "app-client" || layer.name() == "client")
-                && let Some(dynamic_entry_module) =
-                    ResolvedVc::try_downcast_type::<NextDynamicEntryModule>(module)
-            {
-                return Ok(Some((
-                    module,
-                    DynamicImportEntriesMapType::DynamicEntry(dynamic_entry_module),
-                )));
+        .iter_nodes_with_boundary()
+        .map(|(module, boundary)| async move {
+            // Check boundary info first (preferred path)
+            if let Some(boundary) = boundary {
+                let boundary_info = boundary.await?;
+                if boundary_info.boundary_type == boundary_type_dynamic_entry() {
+                    // Check layer constraint
+                    if module.ident().await?.layer.as_ref().is_some_and(|layer| {
+                        layer.name() == "app-client" || layer.name() == "client"
+                    }) {
+                        return Ok(Some((
+                            module,
+                            DynamicImportEntriesMapType::DynamicEntry(module),
+                        )));
+                    }
+                }
             }
+
             // TODO add this check once these modules have the correct layer
             // if layer.is_some_and(|layer| &**layer == "app-rsc") {
             if let Some(client_reference_module) =

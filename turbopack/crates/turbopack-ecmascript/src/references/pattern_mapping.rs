@@ -313,7 +313,7 @@ async fn to_single_pattern_mapping(
     resolve_type: ResolveType,
 ) -> Result<SinglePatternMapping> {
     let module = match resolve_item {
-        ModuleResolveResultItem::Module(module) => *module,
+        ModuleResolveResultItem::Module { module, .. } => *module,
         ModuleResolveResultItem::External { name: s, ty, .. } => {
             return Ok(SinglePatternMapping::External(s.clone(), *ty));
         }

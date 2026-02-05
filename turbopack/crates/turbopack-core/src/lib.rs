@@ -9,6 +9,7 @@
 #![feature(hash_set_entry)]
 
 pub mod asset;
+pub mod boundary;
 pub mod changed;
 pub mod chunk;
 pub mod code_builder;

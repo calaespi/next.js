@@ -1,17 +1,20 @@
-use anyhow::{Result, bail};
-use turbo_tasks::{ResolvedVc, Vc};
+use anyhow::Result;
+use turbo_tasks::Vc;
 use turbopack::{ModuleAssetContext, transition::Transition};
 use turbopack_core::{
+    boundary::BoundaryInfo,
     context::{AssetContext, ProcessResult},
     reference_type::ReferenceType,
     source::Source,
 };
-use turbopack_ecmascript::chunk::EcmascriptChunkPlaceable;
 
-use super::server_component_module::NextServerComponentModule;
+use crate::boundary_types::boundary_type_server_component;
 
-/// This transition wraps a module into a marker
-/// [`Vc<NextServerComponentModule>`].
+/// This transition marks a module as a server component boundary.
+///
+/// Instead of wrapping the module in a marker type, this transition attaches
+/// boundary metadata to the ProcessResult, which is then propagated through
+/// the module resolution infrastructure.
 ///
 /// When walking the module graph to build the client reference manifest, this
 /// is used to determine under which server component CSS client references are
@@ -48,18 +51,19 @@ impl Transition for NextServerComponentTransition {
 
         Ok(
             match &*module_asset_context.process(source, reference_type).await? {
-                ProcessResult::Module(module) => {
-                    let Some(module) =
-                        ResolvedVc::try_sidecast::<Box<dyn EcmascriptChunkPlaceable>>(*module)
-                    else {
-                        bail!("not an ecmascript module");
-                    };
-
-                    // Create the server component module with the original source path
-                    let server_component = NextServerComponentModule::new(*module, source_path);
-
-                    ProcessResult::Module(ResolvedVc::upcast(server_component.to_resolved().await?))
-                        .cell()
+                ProcessResult::Module { module, boundary } => {
+                    // Return the module with boundary info attached (or preserve existing boundary)
+                    ProcessResult::Module {
+                        module: *module,
+                        boundary: boundary.or(Some(
+                            BoundaryInfo::with_source_path(
+                                boundary_type_server_component(),
+                                source_path,
+                            )
+                            .resolved_cell(),
+                        )),
+                    }
+                    .cell()
                 }
                 ProcessResult::Unknown(source) => ProcessResult::Unknown(*source).cell(),
                 ProcessResult::Ignore => ProcessResult::Ignore.cell(),

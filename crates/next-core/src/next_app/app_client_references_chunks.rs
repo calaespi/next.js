@@ -9,15 +9,12 @@ use turbopack_core::{
     output::OutputAssetsWithReferenced,
 };
 
-use crate::{
-    next_client_reference::{
-        ClientReferenceType,
-        ecmascript_client_reference::ecmascript_client_reference_module::{
-            ecmascript_client_reference_merge_tag, ecmascript_client_reference_merge_tag_ssr,
-        },
-        visit_client_reference::ClientReferenceGraphResult,
+use crate::next_client_reference::{
+    ClientReferenceType, ServerComponentEntry,
+    ecmascript_client_reference::ecmascript_client_reference_module::{
+        ecmascript_client_reference_merge_tag, ecmascript_client_reference_merge_tag_ssr,
     },
-    next_server_component::server_component_module::NextServerComponentModule,
+    visit_client_reference::ClientReferenceGraphResult,
 };
 
 #[turbo_tasks::value]
@@ -30,7 +27,7 @@ pub struct ClientReferencesChunks {
         FxIndexMap<ClientReferenceType, ResolvedVc<OutputAssetsWithReferenced>>,
     #[bincode(with = "turbo_bincode::indexmap")]
     pub layout_segment_client_chunks:
-        FxIndexMap<ResolvedVc<NextServerComponentModule>, ResolvedVc<OutputAssetsWithReferenced>>,
+        FxIndexMap<ServerComponentEntry, ResolvedVc<OutputAssetsWithReferenced>>,
 }
 
 /// Computes all client references chunks.
@@ -178,14 +175,18 @@ pub async fn get_app_client_references_chunks(
                 client_references_by_server_component.into_iter()
             {
                 let parent_chunk_group = *chunk_group_info
-                    .get_index_of(ChunkGroup::Shared(ResolvedVc::upcast(
-                        server_component.await?.module,
-                    )))
+                    .get_index_of(ChunkGroup::Shared(server_component.module))
                     .await?;
 
-                let base_ident = server_component.ident();
+                let base_ident = (*server_component.module).ident();
 
-                let server_path = server_component.server_path().owned().await?;
+                // Get server path from boundary info (source_path is always set for server
+                // components)
+                let boundary = server_component.boundary.await?;
+                let server_path = boundary
+                    .source_path
+                    .clone()
+                    .expect("server component boundary should have source_path");
                 let is_layout = server_path.file_stem() == Some("layout");
                 let server_component_path = server_path.value_to_string().await?;
 

@@ -406,13 +406,15 @@ async fn build_manifest(
 
         // per layout segment chunks need to be emitted into the manifest too
         for (server_component, client_assets) in layout_segment_client_chunks.iter() {
-            // Use source_path() to get the original source path (e.g., page.mdx) instead of
-            // server_path() which returns the transformed path (e.g., page.mdx.tsx).
+            // Get source path from boundary info (source_path is always set for server components).
             // This ensures the manifest key matches what the LoaderTree stores and what
             // the runtime looks up after stripping one extension.
-            let server_component_name = server_component
-                .source_path()
-                .await?
+            let boundary = server_component.boundary.await?;
+            let source_path = boundary
+                .source_path
+                .clone()
+                .expect("server component boundary should have source_path");
+            let server_component_name = source_path
                 .with_extension("")
                 .value_to_string()
                 .owned()

@@ -5,12 +5,10 @@ use either::Either;
 use futures::join;
 use next_core::{
     next_client_reference::{
-        ClientReference, ClientReferenceGraphResult, ClientReferenceType, ServerEntries,
-        find_server_entries,
+        ClientReference, ClientReferenceGraphResult, ClientReferenceType, ServerComponentEntry,
+        ServerEntries, ServerUtilEntry, find_server_entries,
     },
-    next_dynamic::NextDynamicEntryModule,
     next_manifests::ActionLayer,
-    next_server_utility::server_utility_module::NextServerUtilityModule,
 };
 use rustc_hash::FxHashMap;
 use tracing::Instrument;
@@ -123,10 +121,7 @@ impl NextDynamicGraphs {
 
 #[turbo_tasks::value(transparent)]
 pub struct DynamicImportEntriesWithImporter(
-    pub  Vec<(
-        ResolvedVc<NextDynamicEntryModule>,
-        Option<ClientReferenceType>,
-    )>,
+    pub Vec<(ResolvedVc<Box<dyn Module>>, Option<ClientReferenceType>)>,
 );
 
 #[turbo_tasks::value_impl]
@@ -562,9 +557,9 @@ impl ClientReferencesGraph {
             // Because we care about 'evaluation order' we need to collect client references in the
             // post_order callbacks which is the same as evaluation order
             let mut client_references = Vec::new();
-            let mut server_utils = FxIndexSet::default();
+            let mut server_utils: FxIndexSet<ServerUtilEntry> = FxIndexSet::default();
 
-            let mut server_components = FxIndexSet::default();
+            let mut server_components: FxIndexSet<ServerComponentEntry> = FxIndexSet::default();
 
             // Perform a DFS traversal to find all server components included by this page.
             graph.traverse_nodes_dfs(
@@ -573,47 +568,42 @@ impl ClientReferencesGraph {
                 |node, _| {
                     let module_type = data.get(&node);
                     Ok(match module_type {
-                        Some(
-                            ClientManifestEntryType::EcmascriptClientReference { .. }
-                            | ClientManifestEntryType::CssClientReference { .. }
-                            | ClientManifestEntryType::ServerComponent { .. },
-                        ) => GraphTraversalAction::Skip,
+                        Some(_) => GraphTraversalAction::Skip,
                         None => GraphTraversalAction::Continue,
                     })
                 },
                 |node, _| {
-                    if let Some(server_util_module) =
-                        ResolvedVc::try_downcast_type::<NextServerUtilityModule>(node)
-                    {
-                        // Server utility used by the template, not a server component
-                        server_utils.insert(server_util_module);
+                    let Some(module_type) = data.get(&node) else {
                         return Ok(());
-                    }
-
-                    let module_type = data.get(&node);
-
-                    let ty = match module_type {
-                        Some(ClientManifestEntryType::EcmascriptClientReference {
-                            module,
-                            ssr_module: _,
-                        }) => ClientReferenceType::EcmascriptClientReference(*module),
-                        Some(ClientManifestEntryType::CssClientReference(module)) => {
-                            ClientReferenceType::CssClientReference(*module)
-                        }
-                        Some(ClientManifestEntryType::ServerComponent(sc)) => {
-                            server_components.insert(*sc);
-                            return Ok(());
-                        }
-                        None => {
-                            return Ok(());
-                        }
                     };
 
-                    // Client reference used by the template, not a server component
-                    client_references.push(ClientReference {
-                        server_component: None,
-                        ty,
-                    });
+                    match module_type {
+                        ClientManifestEntryType::EcmascriptClientReference { module, .. } => {
+                            client_references.push(ClientReference {
+                                server_component: None,
+                                ty: ClientReferenceType::EcmascriptClientReference(*module),
+                            });
+                        }
+                        ClientManifestEntryType::CssClientReference(module) => {
+                            client_references.push(ClientReference {
+                                server_component: None,
+                                ty: ClientReferenceType::CssClientReference(*module),
+                            });
+                        }
+                        ClientManifestEntryType::Boundary {
+                            boundary,
+                            is_server_component,
+                        } => {
+                            if *is_server_component {
+                                server_components.insert(ServerComponentEntry {
+                                    module: node,
+                                    boundary: *boundary,
+                                });
+                            } else {
+                                server_utils.insert(ServerUtilEntry { module: node });
+                            }
+                        }
+                    }
 
                     Ok(())
                 },
@@ -624,7 +614,7 @@ impl ClientReferencesGraph {
             // determine the order of client references individually for each server component.
             for sc in server_components.iter().copied() {
                 graph.traverse_nodes_dfs(
-                    std::iter::once(ResolvedVc::upcast(sc)),
+                    std::iter::once(sc.module),
                     &mut (),
                     |node, _| {
                         let module = node;
@@ -640,33 +630,30 @@ impl ClientReferencesGraph {
                     },
                     |node, _| {
                         let module = node;
-                        if let Some(server_util_module) =
-                            ResolvedVc::try_downcast_type::<NextServerUtilityModule>(module)
-                        {
-                            server_utils.insert(server_util_module);
-                        }
 
                         let Some(module_type) = data.get(&module) else {
                             return Ok(());
                         };
 
-                        let ty = match module_type {
+                        match module_type {
                             ClientManifestEntryType::EcmascriptClientReference {
-                                module,
-                                ssr_module: _,
-                            } => ClientReferenceType::EcmascriptClientReference(*module),
+                                module, ..
+                            } => {
+                                client_references.push(ClientReference {
+                                    server_component: Some(sc),
+                                    ty: ClientReferenceType::EcmascriptClientReference(*module),
+                                });
+                            }
                             ClientManifestEntryType::CssClientReference(module) => {
-                                ClientReferenceType::CssClientReference(*module)
+                                client_references.push(ClientReference {
+                                    server_component: Some(sc),
+                                    ty: ClientReferenceType::CssClientReference(*module),
+                                });
                             }
-                            ClientManifestEntryType::ServerComponent(_) => {
-                                return Ok(());
+                            ClientManifestEntryType::Boundary { .. } => {
+                                // Skip boundaries in this traversal
                             }
-                        };
-
-                        client_references.push(ClientReference {
-                            server_component: Some(sc),
-                            ty,
-                        });
+                        }
 
                         Ok(())
                     },

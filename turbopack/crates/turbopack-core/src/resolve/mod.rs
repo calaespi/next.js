@@ -24,6 +24,7 @@ use turbo_tasks_fs::{FileSystemEntryType, FileSystemPath};
 use turbo_unix_path::normalize_request;
 
 use crate::{
+    boundary::BoundaryInfo,
     context::AssetContext,
     data_uri_source::DataUriSource,
     file_source::FileSource,
@@ -89,7 +90,11 @@ type AfterResolvePluginWithCondition = (
 #[turbo_tasks::value(shared)]
 #[derive(Clone, Debug)]
 pub enum ModuleResolveResultItem {
-    Module(ResolvedVc<Box<dyn Module>>),
+    /// Module with optional boundary metadata - used for server components, client refs, etc.
+    Module {
+        module: ResolvedVc<Box<dyn Module>>,
+        boundary: Option<ResolvedVc<BoundaryInfo>>,
+    },
     OutputAsset(ResolvedVc<Box<dyn OutputAsset>>),
     External {
         /// uri, path, reference, etc.
@@ -106,10 +111,10 @@ pub enum ModuleResolveResultItem {
 
 impl ModuleResolveResultItem {
     async fn as_module(&self) -> Result<Option<ResolvedVc<Box<dyn Module>>>> {
-        Ok(match *self {
-            ModuleResolveResultItem::Module(module) => Some(module),
+        Ok(match self {
+            ModuleResolveResultItem::Module { module, .. } => Some(*module),
             ModuleResolveResultItem::Unknown(source) => {
-                emit_unknown_module_type_error(*source).await?;
+                emit_unknown_module_type_error(**source).await?;
                 None
             }
             ModuleResolveResultItem::Error(_err) => {
@@ -118,6 +123,14 @@ impl ModuleResolveResultItem {
             }
             _ => None,
         })
+    }
+
+    /// Get the boundary info if present
+    pub fn boundary(&self) -> Option<ResolvedVc<BoundaryInfo>> {
+        match self {
+            ModuleResolveResultItem::Module { boundary, .. } => *boundary,
+            _ => None,
+        }
     }
 }
 
@@ -219,8 +232,14 @@ impl ModuleResolveResult {
         module: ResolvedVc<Box<dyn Module>>,
     ) -> ResolvedVc<Self> {
         ModuleResolveResult {
-            primary: vec![(request_key, ModuleResolveResultItem::Module(module))]
-                .into_boxed_slice(),
+            primary: vec![(
+                request_key,
+                ModuleResolveResultItem::Module {
+                    module,
+                    boundary: None,
+                },
+            )]
+            .into_boxed_slice(),
             affecting_sources: Default::default(),
         }
         .resolved_cell()
@@ -247,7 +266,15 @@ impl ModuleResolveResult {
         ModuleResolveResult {
             primary: modules
                 .into_iter()
-                .map(|(k, v)| (k, ModuleResolveResultItem::Module(v)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        ModuleResolveResultItem::Module {
+                            module: v,
+                            boundary: None,
+                        },
+                    )
+                })
                 .collect(),
             affecting_sources: Default::default(),
         }
@@ -261,7 +288,15 @@ impl ModuleResolveResult {
         ModuleResolveResult {
             primary: modules
                 .into_iter()
-                .map(|(k, v)| (k, ModuleResolveResultItem::Module(v)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        ModuleResolveResultItem::Module {
+                            module: v,
+                            boundary: None,
+                        },
+                    )
+                })
                 .collect(),
             affecting_sources: affecting_sources.into_boxed_slice(),
         }
@@ -274,18 +309,26 @@ impl ModuleResolveResult {
     pub fn primary_modules_raw_iter(
         &self,
     ) -> impl Iterator<Item = ResolvedVc<Box<dyn Module>>> + '_ {
-        self.primary.iter().filter_map(|(_, item)| match *item {
-            ModuleResolveResultItem::Module(a) => Some(a),
+        self.primary.iter().filter_map(|(_, item)| match item {
+            ModuleResolveResultItem::Module { module, .. } => Some(*module),
             _ => None,
         })
     }
 
-    /// Returns a set (no duplicates) of primary modules in the result.
-    pub async fn primary_modules_ref(&self) -> Result<Vec<ResolvedVc<Box<dyn Module>>>> {
+    /// Returns primary modules with their boundary info (if any).
+    pub async fn primary_modules_with_boundary_ref(
+        &self,
+    ) -> Result<
+        Vec<(
+            ResolvedVc<Box<dyn Module>>,
+            Option<ResolvedVc<BoundaryInfo>>,
+        )>,
+    > {
         let mut set = FxIndexSet::default();
         for (_, item) in self.primary.iter() {
             if let Some(module) = item.as_module().await? {
-                set.insert(module);
+                let boundary = item.boundary();
+                set.insert((module, boundary));
             }
         }
         Ok(set.into_iter().collect())
@@ -850,9 +893,10 @@ impl ResolveResult {
     pub async fn as_raw_module_result(&self) -> Result<Vc<ModuleResolveResult>> {
         Ok(self
             .map_module(|asset| async move {
-                Ok(ModuleResolveResultItem::Module(ResolvedVc::upcast(
-                    RawModule::new(*asset).to_resolved().await?,
-                )))
+                Ok(ModuleResolveResultItem::Module {
+                    module: ResolvedVc::upcast(RawModule::new(*asset).to_resolved().await?),
+                    boundary: None,
+                })
             })
             .await?
             .cell())

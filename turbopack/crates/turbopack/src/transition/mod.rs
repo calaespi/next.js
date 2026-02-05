@@ -115,11 +115,13 @@ pub trait Transition {
             .await?
             .await?
         {
-            ProcessResult::Module(m) => ProcessResult::Module(
-                self.process_module(**m, module_asset_context)
+            ProcessResult::Module { module, boundary } => ProcessResult::Module {
+                module: self
+                    .process_module(**module, module_asset_context)
                     .to_resolved()
                     .await?,
-            ),
+                boundary: *boundary,
+            },
             ProcessResult::Unknown(source) => ProcessResult::Unknown(*source),
             ProcessResult::Ignore => ProcessResult::Ignore,
         }

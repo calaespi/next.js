@@ -6,6 +6,7 @@ use next_core::{
         Entrypoints as AppEntrypoints, FileSystemPathVec, MetadataItem, collect_root_params,
         get_entrypoints,
     },
+    boundary_types::SERVER_UTILITY_MERGE_TAG,
     get_edge_resolve_options_context, get_next_package,
     next_app::{
         AppEntry, AppPage, get_app_client_references_chunks, get_app_client_shared_chunk_group,
@@ -17,7 +18,8 @@ use next_core::{
     },
     next_client_reference::{
         ClientReferenceGraphResult, NextCssClientReferenceTransition,
-        NextEcmascriptClientReferenceTransition, ServerEntries, find_server_entries,
+        NextEcmascriptClientReferenceTransition, ServerEntries, ServerUtilEntry,
+        find_server_entries,
     },
     next_config::NextConfig,
     next_dynamic::NextDynamicTransition,
@@ -30,7 +32,7 @@ use next_core::{
         ServerContextType, get_server_module_options_context, get_server_resolve_options_context,
     },
     next_server_component::NextServerComponentTransition,
-    next_server_utility::{NEXT_SERVER_UTILITY_MERGE_TAG, NextServerUtilityTransition},
+    next_server_utility::NextServerUtilityTransition,
     parse_segment_config_from_source,
     segment_config::{NextSegmentConfig, ParseSegmentMode},
     util::{NextRuntime, app_function_name, module_styles_rule_condition, styles_rule_condition},
@@ -887,12 +889,11 @@ impl AppProject {
                         vec![
                             ChunkGroupEntry::SharedMerged {
                                 parent: Box::new(rsc_entry_chunk_group.clone()),
-                                merge_tag: NEXT_SERVER_UTILITY_MERGE_TAG.clone(),
+                                merge_tag: SERVER_UTILITY_MERGE_TAG.clone(),
                                 entries: server_utils
                                     .iter()
-                                    .map(async |m| Ok(ResolvedVc::upcast(m.await?.module)))
-                                    .try_join()
-                                    .await?,
+                                    .map(|m: &ServerUtilEntry| m.module)
+                                    .collect(),
                             },
                             ChunkGroupEntry::Entry(client_shared_entries),
                         ],
@@ -906,20 +907,26 @@ impl AppProject {
                     // Skip the last server component, which is the page itself, because that one
                     // won't have it's visited modules added, and will be visited in the next step
                     // as part of rsc_entry
-                    for module in server_component_entries
+                    for entry in server_component_entries
                         .iter()
                         .take(server_component_entries.len().saturating_sub(1))
                     {
                         let graph = SingleModuleGraph::new_with_entries_visited_intern(
-                            // This should really be ChunkGroupEntry::Shared(module.await?.module),
+                            // This should really be ChunkGroupEntry::Shared(entry.module),
                             // but that breaks everything for some reason.
-                            vec![ChunkGroupEntry::Entry(vec![ResolvedVc::upcast(*module)])],
+                            vec![ChunkGroupEntry::Entry(vec![entry.module])],
                             visited_modules,
                             should_trace,
                             should_read_binding_usage,
                         );
                         graphs.push(graph);
-                        let is_layout = module.server_path().await?.file_stem() == Some("layout");
+                        // Check if this is a layout by examining the source path from boundary info
+                        let boundary = entry.boundary.await?;
+                        let source_path = boundary
+                            .source_path
+                            .as_ref()
+                            .expect("server component boundary should have source_path");
+                        let is_layout = source_path.file_stem() == Some("layout");
                         visited_modules = if is_layout {
                             // Only propagate the visited_modules of the parent layout(s), not
                             // across siblings such as loading.js and
@@ -1800,12 +1807,11 @@ impl AppEndpoint {
                     let client_references = client_references.await?;
                     let span = tracing::trace_span!("server utils");
                     async {
-                        let server_utils = client_references
+                        let server_utils: Vec<_> = client_references
                             .server_utils
                             .iter()
-                            .map(async |m| Ok(ResolvedVc::upcast(m.await?.module)))
-                            .try_join()
-                            .await?;
+                            .map(|m| m.module)
+                            .collect();
                         let chunk_group = chunking_context
                             .chunk_group(
                                 AssetIdent::from_path(
@@ -1839,15 +1845,13 @@ impl AppEndpoint {
                     {
                         let span = tracing::trace_span!(
                             "layout segment",
-                            name = display(server_component.ident().to_string().await?)
+                            name = display((*server_component.module).ident().to_string().await?)
                         );
                         async {
                             let chunk_group = chunking_context.chunk_group(
-                                server_component.ident(),
+                                (*server_component.module).ident(),
                                 // TODO this should be ChunkGroup::Shared
-                                ChunkGroup::Entry(vec![ResolvedVc::upcast(
-                                    server_component.await?.module,
-                                )]),
+                                ChunkGroup::Entry(vec![server_component.module]),
                                 module_graph,
                                 current_chunk_group.await?.availability_info,
                             );

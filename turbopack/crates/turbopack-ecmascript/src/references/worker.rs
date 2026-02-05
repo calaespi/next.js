@@ -174,79 +174,78 @@ impl ModuleReference for WorkerAssetReference {
         let mut primary = Vec::with_capacity(result_ref.primary.len());
 
         for (request_key, resolve_item) in result_ref.primary.iter() {
-            match resolve_item {
-                ModuleResolveResultItem::Module(module) => {
-                    let module_ident = module.ident().to_string().await?;
-
-                    let Some(chunkable) =
-                        ResolvedVc::try_downcast::<Box<dyn ChunkableModule>>(*module)
-                    else {
-                        CodeGenerationIssue {
-                            severity: self.get_module_type_issue_severity().await?,
-                            title: StyledString::Text(rcstr!("non-chunkable module"))
-                                .resolved_cell(),
-                            message: StyledString::Text(
-                                format!(
-                                    "Worker entry point module '{}' is not chunkable and cannot \
-                                     be used as a worker module. This may happen if the module \
-                                     type doesn't support bundling.",
-                                    module_ident
-                                )
-                                .into(),
-                            )
-                            .resolved_cell(),
-                            path: self.origin.origin_path().owned().await?,
-                            source: Some(self.issue_source),
-                        }
-                        .resolved_cell()
-                        .emit();
-                        continue;
-                    };
-
-                    // For Node.js worker threads, the module must also be evaluatable since
-                    // it becomes an entry point
-                    if matches!(self.worker_type, WorkerType::NodeWorkerThread)
-                        && ResolvedVc::try_sidecast::<Box<dyn EvaluatableAsset>>(chunkable)
-                            .is_none()
-                    {
-                        CodeGenerationIssue {
-                            severity: self.get_module_type_issue_severity().await?,
-                            title: StyledString::Text(rcstr!("non-evaluatable module"))
-                                .resolved_cell(),
-                            message: StyledString::Text(
-                                format!(
-                                    "Worker thread entry point module '{}' must be evaluatable to \
-                                     serve as an entry point. This module cannot be used as a \
-                                     Node.js worker_threads Worker entry point because it doesn't \
-                                     support direct evaluation.",
-                                    module_ident
-                                )
-                                .into(),
-                            )
-                            .resolved_cell(),
-                            path: self.origin.origin_path().owned().await?,
-                            source: Some(self.issue_source),
-                        }
-                        .resolved_cell()
-                        .emit();
-                        continue;
-                    }
-
-                    let loader =
-                        WorkerLoaderModule::new(*chunkable, self.worker_type, *asset_context)
-                            .to_resolved()
-                            .await?;
-
-                    primary.push((
-                        request_key.clone(),
-                        ModuleResolveResultItem::Module(ResolvedVc::upcast(loader)),
-                    ));
-                }
+            let module = match resolve_item {
+                ModuleResolveResultItem::Module { module, .. } => module,
                 // Pass through other result types (External, Ignore, etc.)
                 _ => {
                     primary.push((request_key.clone(), resolve_item.clone()));
+                    continue;
                 }
+            };
+
+            let module_ident = module.ident().to_string().await?;
+
+            let Some(chunkable) = ResolvedVc::try_downcast::<Box<dyn ChunkableModule>>(*module)
+            else {
+                CodeGenerationIssue {
+                    severity: self.get_module_type_issue_severity().await?,
+                    title: StyledString::Text(rcstr!("non-chunkable module")).resolved_cell(),
+                    message: StyledString::Text(
+                        format!(
+                            "Worker entry point module '{}' is not chunkable and cannot be used \
+                             as a worker module. This may happen if the module type doesn't \
+                             support bundling.",
+                            module_ident
+                        )
+                        .into(),
+                    )
+                    .resolved_cell(),
+                    path: self.origin.origin_path().owned().await?,
+                    source: Some(self.issue_source),
+                }
+                .resolved_cell()
+                .emit();
+                continue;
+            };
+
+            // For Node.js worker threads, the module must also be evaluatable since
+            // it becomes an entry point
+            if matches!(self.worker_type, WorkerType::NodeWorkerThread)
+                && ResolvedVc::try_sidecast::<Box<dyn EvaluatableAsset>>(chunkable).is_none()
+            {
+                CodeGenerationIssue {
+                    severity: self.get_module_type_issue_severity().await?,
+                    title: StyledString::Text(rcstr!("non-evaluatable module")).resolved_cell(),
+                    message: StyledString::Text(
+                        format!(
+                            "Worker thread entry point module '{}' must be evaluatable to serve \
+                             as an entry point. This module cannot be used as a Node.js \
+                             worker_threads Worker entry point because it doesn't support direct \
+                             evaluation.",
+                            module_ident
+                        )
+                        .into(),
+                    )
+                    .resolved_cell(),
+                    path: self.origin.origin_path().owned().await?,
+                    source: Some(self.issue_source),
+                }
+                .resolved_cell()
+                .emit();
+                continue;
             }
+
+            let loader = WorkerLoaderModule::new(*chunkable, self.worker_type, *asset_context)
+                .to_resolved()
+                .await?;
+
+            primary.push((
+                request_key.clone(),
+                ModuleResolveResultItem::Module {
+                    module: ResolvedVc::upcast(loader),
+                    boundary: None,
+                },
+            ));
         }
 
         Ok(ModuleResolveResult {

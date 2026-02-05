@@ -4,6 +4,7 @@ use turbo_tasks::{ResolvedVc, Vc};
 use turbo_tasks_fs::FileSystemPath;
 
 use crate::{
+    boundary::BoundaryInfo,
     compile_time_info::CompileTimeInfo,
     ident::Layer,
     issue::module::emit_unknown_module_type_error,
@@ -15,8 +16,11 @@ use crate::{
 
 #[turbo_tasks::value(shared)]
 pub enum ProcessResult {
-    /// A module was created.
-    Module(ResolvedVc<Box<dyn Module>>),
+    /// A module was created, optionally with boundary metadata.
+    Module {
+        module: ResolvedVc<Box<dyn Module>>,
+        boundary: Option<ResolvedVc<BoundaryInfo>>,
+    },
 
     /// A module could not be created (according to the rules, e.g. no module type was assigned)
     Unknown(ResolvedVc<Box<dyn Source>>),
@@ -26,12 +30,22 @@ pub enum ProcessResult {
     Ignore,
 }
 
+impl ProcessResult {
+    /// Get the boundary info if present
+    pub fn boundary(&self) -> Option<ResolvedVc<BoundaryInfo>> {
+        match self {
+            ProcessResult::Module { boundary, .. } => *boundary,
+            _ => None,
+        }
+    }
+}
+
 #[turbo_tasks::value_impl]
 impl ProcessResult {
     #[turbo_tasks::function]
     pub fn module(&self) -> Result<Vc<Box<dyn Module>>> {
-        match *self {
-            ProcessResult::Module(m) => Ok(*m),
+        match self {
+            ProcessResult::Module { module, .. } => Ok(**module),
             ProcessResult::Ignore => {
                 bail!("Expected process result to be a module, but it was ignored")
             }
@@ -45,7 +59,7 @@ impl ProcessResult {
     #[turbo_tasks::function]
     pub async fn try_into_module(&self) -> Result<Vc<OptionModule>> {
         Ok(Vc::cell(match self {
-            ProcessResult::Module(module) => Some(*module),
+            ProcessResult::Module { module, .. } => Some(*module),
             ProcessResult::Unknown(source) => {
                 emit_unknown_module_type_error(**source).await?;
                 None

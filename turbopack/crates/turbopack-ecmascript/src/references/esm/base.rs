@@ -294,9 +294,9 @@ impl ReferencedAsset {
                 } => {
                     return Ok(ReferencedAsset::External(request.clone(), *ty).cell());
                 }
-                &ModuleResolveResultItem::Module(module) => {
+                ModuleResolveResultItem::Module { module, .. } => {
                     if let Some(placeable) =
-                        ResolvedVc::try_downcast::<Box<dyn EcmascriptChunkPlaceable>>(module)
+                        ResolvedVc::try_downcast::<Box<dyn EcmascriptChunkPlaceable>>(*module)
                     {
                         return Ok(ReferencedAsset::Some(placeable).cell());
                     }

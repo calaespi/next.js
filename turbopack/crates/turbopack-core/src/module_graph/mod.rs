@@ -26,6 +26,7 @@ use turbo_tasks::{
 use turbo_tasks_fs::FileSystemPath;
 
 use crate::{
+    boundary::BoundaryInfo,
     chunk::{AsyncModuleInfo, ChunkingContext, ChunkingType},
     issue::{ImportTracer, ImportTraces, Issue},
     module::Module,
@@ -144,7 +145,7 @@ impl VisitedModules {
                 .await?
                 .enumerate_nodes()
                 .flat_map(|(node_idx, module)| match module {
-                    SingleModuleGraphNode::Module(module) => Some((
+                    SingleModuleGraphNode::Module { module, .. } => Some((
                         *module,
                         GraphNodeIndex {
                             graph_idx: 0,
@@ -184,7 +185,7 @@ impl VisitedModules {
                 graph
                     .enumerate_nodes()
                     .flat_map(|(node_idx, module)| match module {
-                        SingleModuleGraphNode::Module(module) => Some((
+                        SingleModuleGraphNode::Module { module, .. } => Some((
                             *module,
                             GraphNodeIndex {
                                 graph_idx: this.next_graph_idx,
@@ -279,7 +280,7 @@ impl SingleModuleGraph {
         let root_nodes = entries
             .iter()
             .flat_map(|e| e.entries())
-            .map(|e| SingleModuleGraphBuilderNode::new_module(emit_spans, e))
+            .map(|e| SingleModuleGraphBuilderNode::new_module(emit_spans, e, None))
             .try_join()
             .await?;
 
@@ -311,9 +312,15 @@ impl SingleModuleGraph {
             let _span = tracing::info_span!("build module graph").entered();
             for (parent, current) in children_nodes_iter.into_breadth_first_edges() {
                 let (module, graph_node, count) = match current {
-                    SingleModuleGraphBuilderNode::Module { module, ident: _ } => {
-                        (module, SingleModuleGraphNode::Module(module), 1)
-                    }
+                    SingleModuleGraphBuilderNode::Module {
+                        module,
+                        ident: _,
+                        boundary,
+                    } => (
+                        module,
+                        SingleModuleGraphNode::Module { module, boundary },
+                        1,
+                    ),
                     SingleModuleGraphBuilderNode::VisitedModule { module, idx } => (
                         module,
                         SingleModuleGraphNode::VisitedModule { idx, module },
@@ -386,7 +393,22 @@ impl SingleModuleGraph {
     /// Iterate over all nodes in the graph
     pub fn iter_nodes(&self) -> impl Iterator<Item = ResolvedVc<Box<dyn Module>>> + '_ {
         self.graph.node_weights().filter_map(|n| match n {
-            SingleModuleGraphNode::Module(node) => Some(*node),
+            SingleModuleGraphNode::Module { module, .. } => Some(*module),
+            SingleModuleGraphNode::VisitedModule { .. } => None,
+        })
+    }
+
+    /// Iterate over all nodes in the graph with their boundary info
+    pub fn iter_nodes_with_boundary(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            ResolvedVc<Box<dyn Module>>,
+            Option<ResolvedVc<BoundaryInfo>>,
+        ),
+    > + '_ {
+        self.graph.node_weights().filter_map(|n| match n {
+            SingleModuleGraphNode::Module { module, boundary } => Some((*module, *boundary)),
             SingleModuleGraphNode::VisitedModule { .. } => None,
         })
     }
@@ -510,7 +532,7 @@ impl SingleModuleGraph {
                                 let poppped = stack.pop().unwrap();
                                 let popped_state = node_states[poppped.index()].as_mut().unwrap();
                                 popped_state.on_stack = false;
-                                if let SingleModuleGraphNode::Module(module) =
+                                if let SingleModuleGraphNode::Module { module, .. } =
                                     self.graph.node_weight(poppped).unwrap()
                                 {
                                     scc.push(module);
@@ -934,6 +956,19 @@ impl ModuleGraphSnapshot {
 
     pub fn iter_nodes(&self) -> impl Iterator<Item = ResolvedVc<Box<dyn Module>>> + '_ {
         self.graphs.iter().flat_map(|g| g.iter_nodes())
+    }
+
+    pub fn iter_nodes_with_boundary(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            ResolvedVc<Box<dyn Module>>,
+            Option<ResolvedVc<BoundaryInfo>>,
+        ),
+    > + '_ {
+        self.graphs
+            .iter()
+            .flat_map(|g| g.iter_nodes_with_boundary())
     }
 
     /// Iterate the edges of a node REVERSED!
@@ -1484,7 +1519,12 @@ impl SingleModuleGraph {
 
 #[derive(Clone, Debug, Serialize, Deserialize, TraceRawVcs, NonLocalValue)]
 pub enum SingleModuleGraphNode {
-    Module(ResolvedVc<Box<dyn Module>>),
+    Module {
+        module: ResolvedVc<Box<dyn Module>>,
+        /// Boundary info if this module crossed a boundary (e.g., server component, client
+        /// reference)
+        boundary: Option<ResolvedVc<BoundaryInfo>>,
+    },
     // Models a module that is referenced but has already been visited by an earlier graph.
     VisitedModule {
         idx: GraphNodeIndex,
@@ -1495,8 +1535,14 @@ pub enum SingleModuleGraphNode {
 impl SingleModuleGraphNode {
     pub fn module(&self) -> ResolvedVc<Box<dyn Module>> {
         match self {
-            SingleModuleGraphNode::Module(module) => *module,
+            SingleModuleGraphNode::Module { module, .. } => *module,
             SingleModuleGraphNode::VisitedModule { module, .. } => *module,
+        }
+    }
+    pub fn boundary(&self) -> Option<ResolvedVc<BoundaryInfo>> {
+        match self {
+            SingleModuleGraphNode::Module { boundary, .. } => *boundary,
+            SingleModuleGraphNode::VisitedModule { .. } => None,
         }
     }
     pub fn target_idx(&self, direction: Direction) -> Option<GraphNodeIndex> {
@@ -1505,7 +1551,7 @@ impl SingleModuleGraphNode {
                 Direction::Outgoing => Some(*idx),
                 Direction::Incoming => None,
             },
-            SingleModuleGraphNode::Module(_) => None,
+            SingleModuleGraphNode::Module { .. } => None,
         }
     }
 }
@@ -1529,6 +1575,8 @@ enum SingleModuleGraphBuilderNode {
         module: ResolvedVc<Box<dyn Module>>,
         // module.ident().to_string(), eagerly computed for tracing
         ident: Option<ReadRef<RcStr>>,
+        /// Boundary info if this module crossed a boundary
+        boundary: Option<ResolvedVc<BoundaryInfo>>,
     },
     /// A reference to a module that is already listed in visited_modules
     VisitedModule {
@@ -1538,7 +1586,11 @@ enum SingleModuleGraphBuilderNode {
 }
 
 impl SingleModuleGraphBuilderNode {
-    async fn new_module(emit_spans: bool, module: ResolvedVc<Box<dyn Module>>) -> Result<Self> {
+    async fn new_module(
+        emit_spans: bool,
+        module: ResolvedVc<Box<dyn Module>>,
+        boundary: Option<ResolvedVc<BoundaryInfo>>,
+    ) -> Result<Self> {
         Ok(Self::Module {
             module,
             ident: if emit_spans {
@@ -1547,6 +1599,7 @@ impl SingleModuleGraphBuilderNode {
             } else {
                 None
             },
+            boundary,
         })
     }
     fn new_visited_module(module: ResolvedVc<Box<dyn Module>>, idx: GraphNodeIndex) -> Self {
@@ -1617,20 +1670,22 @@ impl Visit<SingleModuleGraphBuilderNode, RefData> for SingleModuleGraphBuilder<'
 
             refs.iter()
                 .flat_map(|(reference, resolved)| {
-                    resolved.modules.iter().map(|m| {
+                    resolved.modules.iter().map(|resolved_module| {
                         (
                             *reference,
                             resolved.chunking_type.clone(),
                             resolved.binding_usage.clone(),
-                            *m,
+                            resolved_module.module,
+                            resolved_module.boundary,
                         )
                     })
                 })
-                .map(async |(reference, ty, binding_usage, target)| {
+                .map(async |(reference, ty, binding_usage, target, boundary)| {
                     let to = if let Some(idx) = visited_modules.get(&target) {
                         SingleModuleGraphBuilderNode::new_visited_module(target, *idx)
                     } else {
-                        SingleModuleGraphBuilderNode::new_module(emit_spans, target).await?
+                        SingleModuleGraphBuilderNode::new_module(emit_spans, target, boundary)
+                            .await?
                     };
                     Ok((
                         to,
@@ -2101,7 +2156,9 @@ pub mod tests {
                     .enumerate_nodes()
                     .map(|(_index, module)| async move {
                         Ok(match module {
-                            crate::module_graph::SingleModuleGraphNode::Module(module) => {
+                            crate::module_graph::SingleModuleGraphNode::Module {
+                                module, ..
+                            } => {
                                 if module.ident().to_string().owned().await.unwrap()
                                     == "[test]/d.js"
                                 {
