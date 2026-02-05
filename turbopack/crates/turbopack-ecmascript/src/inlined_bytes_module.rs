@@ -6,18 +6,17 @@ use turbo_tasks::{ResolvedVc, ValueToString, Vc};
 use turbo_tasks_fs::{FileContent, rope::RopeBuilder};
 use turbopack_core::{
     asset::Asset,
-    chunk::{ChunkItem, ChunkType, ChunkableModule, ChunkingContext},
+    chunk::{AsyncModuleInfo, ChunkableModule, ChunkingContext},
     ident::AssetIdent,
     module::{Module, ModuleSideEffects},
     module_graph::ModuleGraph,
-    output::OutputAssetsReference,
     source::Source,
 };
 
 use crate::{
     chunk::{
-        EcmascriptChunkItem, EcmascriptChunkItemContent, EcmascriptChunkPlaceable,
-        EcmascriptChunkType, EcmascriptExports,
+        EcmascriptChunkItemContent, EcmascriptChunkPlaceable, EcmascriptExports,
+        ecmascript_chunk_item,
     },
     runtime_functions::TURBOPACK_EXPORT_VALUE,
     utils::StringifyJs,
@@ -61,13 +60,10 @@ impl ChunkableModule for InlinedBytesJsModule {
     #[turbo_tasks::function]
     fn as_chunk_item(
         self: ResolvedVc<Self>,
-        _module_graph: Vc<ModuleGraph>,
+        module_graph: Vc<ModuleGraph>,
         chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
     ) -> Vc<Box<dyn turbopack_core::chunk::ChunkItem>> {
-        Vc::upcast(InlinedBytesJsChunkItem::cell(InlinedBytesJsChunkItem {
-            module: self,
-            chunking_context,
-        }))
+        ecmascript_chunk_item(Vc::upcast(*self), module_graph, *chunking_context)
     }
 }
 
@@ -77,47 +73,16 @@ impl EcmascriptChunkPlaceable for InlinedBytesJsModule {
     fn get_exports(&self) -> Vc<EcmascriptExports> {
         EcmascriptExports::Value.cell()
     }
-}
-
-#[turbo_tasks::value]
-struct InlinedBytesJsChunkItem {
-    module: ResolvedVc<InlinedBytesJsModule>,
-    chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
-}
-
-#[turbo_tasks::value_impl]
-impl OutputAssetsReference for InlinedBytesJsChunkItem {}
-
-#[turbo_tasks::value_impl]
-impl ChunkItem for InlinedBytesJsChunkItem {
-    #[turbo_tasks::function]
-    fn asset_ident(&self) -> Vc<AssetIdent> {
-        self.module.ident()
-    }
 
     #[turbo_tasks::function]
-    fn chunking_context(&self) -> Vc<Box<dyn ChunkingContext>> {
-        *self.chunking_context
-    }
-
-    #[turbo_tasks::function]
-    async fn ty(&self) -> Result<Vc<Box<dyn ChunkType>>> {
-        Ok(Vc::upcast(
-            Vc::<EcmascriptChunkType>::default().resolve().await?,
-        ))
-    }
-
-    #[turbo_tasks::function]
-    fn module(&self) -> Vc<Box<dyn Module>> {
-        Vc::upcast(*self.module)
-    }
-}
-
-#[turbo_tasks::value_impl]
-impl EcmascriptChunkItem for InlinedBytesJsChunkItem {
-    #[turbo_tasks::function]
-    async fn content(&self) -> Result<Vc<EcmascriptChunkItemContent>> {
-        let content = self.module.await?.source.content().file_content().await?;
+    async fn chunk_item_content(
+        self: Vc<Self>,
+        _chunking_context: Vc<Box<dyn ChunkingContext>>,
+        _module_graph: Vc<ModuleGraph>,
+        _async_module_info: Option<Vc<AsyncModuleInfo>>,
+    ) -> Result<Vc<EcmascriptChunkItemContent>> {
+        let this = self.await?;
+        let content = this.source.content().file_content().await?;
         match &*content {
             FileContent::Content(data) => {
                 let mut inner_code = RopeBuilder::default();
@@ -146,7 +111,7 @@ var decode = Uint8Array.fromBase64 || function Uint8Array_fromBase64(base64) {
                 .cell())
             }
             FileContent::NotFound => {
-                bail!("File not found: {}", self.module.ident().to_string().await?);
+                bail!("File not found: {}", self.ident().to_string().await?);
             }
         }
     }
