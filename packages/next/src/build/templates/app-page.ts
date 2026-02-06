@@ -6,7 +6,7 @@ import {
   type AppPageRouteHandlerContext,
 } from '../../server/route-modules/app-page/module.compiled' with { 'turbopack-transition': 'next-ssr' }
 
-import { RouteKind } from '../../server/route-kind' with { 'turbopack-transition': 'next-server-utility' }
+import { RouteKind } from '../../server/route-kind' with { 'turbopack-transition': 'next-server-utility', 'turbopack-chunking-type': 'shared' }
 
 import { getRevalidateReason } from '../../server/instrumentation/utils'
 import { getTracer, SpanKind, type Span } from '../../server/lib/trace/tracer'
@@ -93,13 +93,13 @@ export const __next_app__ = {
   loadChunk: __next_app_load_chunk__,
 }
 
-import * as entryBase from '../../server/app-render/entry-base' with { 'turbopack-transition': 'next-server-utility' }
+import * as entryBase from '../../server/app-render/entry-base' with { 'turbopack-transition': 'next-server-utility', 'turbopack-chunking-type': 'shared' }
 import { RedirectStatusCode } from '../../client/components/redirect-status-code'
 import { InvariantError } from '../../shared/lib/invariant-error'
 import { scheduleOnNextTick } from '../../lib/scheduler'
 import { isInterceptionRouteAppPath } from '../../shared/lib/router/utils/interception-routes'
 
-export * from '../../server/app-render/entry-base' with { 'turbopack-transition': 'next-server-utility' }
+export * from '../../server/app-render/entry-base' with { 'turbopack-transition': 'next-server-utility', 'turbopack-chunking-type': 'shared' }
 
 // Create and export the route module that will be consumed.
 export const routeModule = new AppPageRouteModule({

@@ -497,6 +497,11 @@ impl ChunkableModuleReference for EsmAssetReference {
                     })
                 } else if chunking_type == "none" {
                     None
+                } else if chunking_type == "shared" {
+                    Some(ChunkingType::Shared {
+                        inherit_async: true,
+                        merge_tag: self.annotations.transition().map(|t| t.to_string().into()),
+                    })
                 } else {
                     return Err(anyhow!(
                         "unknown chunking_type: {}",
