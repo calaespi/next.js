@@ -23,7 +23,6 @@ use crate::{
         async_module::OptionAsyncModule,
         esm::{EsmExport, EsmExports},
     },
-    side_effect_optimization::facade::module::EcmascriptModuleFacadeModule,
 };
 
 /// A module derived from an original ecmascript module that only contains the
@@ -168,25 +167,6 @@ impl EcmascriptChunkPlaceable for EcmascriptModuleLocalsModule {
     #[turbo_tasks::function]
     fn get_async_module(&self) -> Vc<OptionAsyncModule> {
         self.module.get_async_module()
-    }
-
-    #[turbo_tasks::function]
-    async fn get_split(
-        self: Vc<Self>,
-        part: ModulePart,
-    ) -> Result<Vc<Box<dyn EcmascriptChunkPlaceable>>> {
-        // When a locals module is asked for its facade, create the corresponding facade.
-        // Since the locals module exists, we know splitting was enabled when the module was
-        // created.
-        let this = self.await?;
-        if let ModulePart::Locals = part {
-            Ok(Vc::upcast(self))
-        } else {
-            Ok(Vc::upcast(EcmascriptModuleFacadeModule::new(
-                Vc::upcast(*this.module),
-                part,
-            )))
-        }
     }
 }
 
