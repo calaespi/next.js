@@ -532,6 +532,13 @@ async function generateDynamicRSCPayload(
   if (!options?.skipPageRendering) {
     const preloadCallbacks: PreloadCallbacks = []
 
+    // In dev mode during client navigation, check if we need to render all segments
+    // for instant validation. This ensures the complete tree is available for validation.
+    const renderAllSegments =
+      ctx.renderOpts.dev &&
+      flightRouterState !== undefined && // Only for client navigation
+      (await anySegmentNeedsInstantValidation(loaderTree))
+
     const { Viewport, Metadata, MetadataOutlet } = createMetadataComponents({
       tree: loaderTree,
       parsedQuery: query,
@@ -573,6 +580,7 @@ async function generateDynamicRSCPayload(
         rootLayoutIncluded: false,
         preloadCallbacks,
         MetadataOutlet,
+        renderAllSegments,
       })
     ).map((path) => path.slice(1)) // remove the '' (root) segment
   }
@@ -806,7 +814,12 @@ async function generateDynamicFlightRenderResultWithStagesInDev(
     renderOpts,
     requestId,
     workStore,
-    componentMod: { createElement },
+    componentMod: {
+      createElement,
+      routeModule: {
+        userland: { loaderTree },
+      },
+    },
     url,
   } = ctx
 
@@ -834,11 +847,14 @@ async function generateDynamicFlightRenderResultWithStagesInDev(
     onFlightDataRenderError
   )
 
-  // We only validate RSC requests if it is for HMR refreshes since we know we
-  // will render all the layouts necessary to perform the validation.
+  // We validate RSC requests for HMR refreshes and client navigations when
+  // instant configs exist, since we render all the layouts necessary to perform
+  // the validation in those cases.
   const shouldValidate =
     !isBypassingCachesInDev(renderOpts, initialRequestStore) &&
-    initialRequestStore.isHmrRefresh === true
+    (initialRequestStore.isHmrRefresh === true ||
+      // Also validate client navigations when instant configs exist
+      (await anySegmentNeedsInstantValidation(loaderTree)))
 
   const getPayload = async (requestStore: RequestStore) => {
     const payload: RSCPayload &

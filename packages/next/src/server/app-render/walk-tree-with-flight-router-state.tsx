@@ -37,6 +37,7 @@ export async function walkTreeWithFlightRouterState({
   ctx,
   preloadCallbacks,
   MetadataOutlet,
+  renderAllSegments,
 }: {
   loaderTreeToFilter: LoaderTree
   parentParams: { [key: string]: string | string[] }
@@ -50,6 +51,9 @@ export async function walkTreeWithFlightRouterState({
   ctx: AppRenderContext
   preloadCallbacks: PreloadCallbacks
   MetadataOutlet: React.ComponentType
+  /** When true, render all segments even if they match in FlightRouterState.
+   * Used in dev mode with instant validation to ensure the complete tree is available. */
+  renderAllSegments?: boolean
 }): Promise<FlightDataPath[]> {
   const {
     renderOpts: { nextFontManifest, experimental },
@@ -95,6 +99,8 @@ export async function walkTreeWithFlightRouterState({
    * Decide if the current segment is where rendering has to start.
    */
   const renderComponentsOnThisLevel =
+    // In dev mode with instant validation, render all segments
+    renderAllSegments ||
     // No further router state available
     !flightRouterState ||
     // Segment in router state does not match current segment
@@ -284,6 +290,7 @@ export async function walkTreeWithFlightRouterState({
       rootLayoutIncluded: rootLayoutIncludedAtThisLevelOrAbove,
       preloadCallbacks,
       MetadataOutlet,
+      renderAllSegments,
     })
 
     for (const subPath of subPaths) {
