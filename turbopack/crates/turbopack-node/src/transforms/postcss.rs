@@ -539,6 +539,7 @@ impl PostCssTransformedAsset {
             env: *env,
             context_source_for_issue: self.source,
             chunking_context: *chunking_context,
+            evaluate_context: self.evaluate_context,
             module_graph,
             resolve_options_context: None,
             args: vec![
