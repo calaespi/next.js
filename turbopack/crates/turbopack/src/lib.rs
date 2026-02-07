@@ -56,7 +56,6 @@ use turbopack_ecmascript::{
     },
     tree_shake::asset::EcmascriptModulePartAsset,
 };
-use turbopack_json::JsonModuleAsset;
 use turbopack_resolve::{
     resolve::resolve_options, resolve_options_context::ResolveOptionsContext,
     typescript::type_resolve,
@@ -242,7 +241,6 @@ async fn apply_module_type(
                 .await?
             }
         }
-        ModuleType::Json => ResolvedVc::upcast(JsonModuleAsset::new(*source).to_resolved().await?),
         ModuleType::Raw => ResolvedVc::upcast(RawModule::new(*source).to_resolved().await?),
         ModuleType::NodeAddon => {
             ResolvedVc::upcast(NodeAddonModule::new(*source).to_resolved().await?)

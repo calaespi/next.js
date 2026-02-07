@@ -27,7 +27,8 @@ use turbopack_core::{
 use turbopack_css::CssModuleAssetType;
 use turbopack_ecmascript::{
     EcmascriptInputTransform, EcmascriptInputTransforms, EcmascriptOptions, SpecifiedModuleType,
-    bytes_source_transform::BytesSourceTransform, text_source_transform::TextSourceTransform,
+    bytes_source_transform::BytesSourceTransform, json_source_transform::JsonSourceTransform,
+    text_source_transform::TextSourceTransform,
 };
 use turbopack_mdx::MdxTransform;
 use turbopack_node::{
@@ -552,7 +553,10 @@ impl ModuleOptions {
                 RuleCondition::ReferenceType(ReferenceType::EcmaScriptModules(
                     EcmaScriptModulesReferenceSubType::ImportWithType("json".into()),
                 )),
-                vec![ModuleRuleEffect::ModuleType(ModuleType::Json)],
+                vec![ModuleRuleEffect::SourceTransforms(ResolvedVc::cell(vec![
+                    // Use spec-compliant ESM for import attributes
+                    ResolvedVc::upcast(JsonSourceTransform::new_esm().to_resolved().await?),
+                ]))],
             ),
         ]);
 
@@ -563,7 +567,9 @@ impl ModuleOptions {
                     RuleCondition::ResourcePathEndsWith(".json".to_string()),
                     RuleCondition::ContentTypeStartsWith("application/json".to_string()),
                 ]),
-                vec![ModuleRuleEffect::ModuleType(ModuleType::Json)],
+                vec![ModuleRuleEffect::SourceTransforms(ResolvedVc::cell(vec![
+                    ResolvedVc::upcast(JsonSourceTransform::new().to_resolved().await?),
+                ]))],
             ),
             ModuleRule::new_all(
                 RuleCondition::any(vec![

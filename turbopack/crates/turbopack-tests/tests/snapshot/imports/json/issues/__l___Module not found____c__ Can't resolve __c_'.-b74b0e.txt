@@ -1,0 +1,34 @@
+error - [resolve] /turbopack/crates/turbopack-tests/tests/snapshot/imports/json/input/index.js:7:0  Module not found: Can't resolve './invalid.json'
+  
+       3 | 
+       4 | import huge from './huge.json'
+       5 | console.log(huge)
+       6 | 
+         + v----------------------------------v
+       7 + import invalid from './invalid.json'
+         + ^----------------------------------^
+       8 | console.log(invalid['this-is'])
+       9 | 
+  
+  Unable to make a module from invalid JSON: expected `,` or `}` at line 3 column 26
+  
+  Debug info:
+  - Execution of <ModuleAssetContext as AssetContext>::process_resolve_result failed
+  - Execution of <ModuleAssetContext as AssetContext>::process failed
+  - Execution of <JsonSourceTransform as SourceTransform>::transform failed
+  - Unable to make a module from invalid JSON: expected `,` or `}` at line 3 column 26
+      at nested.?
+         1 | {
+         2 |   "nested": {
+           |                          v
+         3 +     "this-is": "invalid" // lint-staged will remove trailing commas, so here's a comment
+           |                          ^
+         4 |   }
+         5 | }
+  
+  
+  | An error happened during resolving.
+  | Parsed request as written in source code: relative './invalid.json'
+  | Path where resolving has started: [project]/turbopack/crates/turbopack-tests/tests/snapshot/imports/json/input/index.js
+  | Type of request: EcmaScript Modules (part) request
+  |
