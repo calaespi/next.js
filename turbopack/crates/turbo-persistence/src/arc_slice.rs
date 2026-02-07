@@ -103,6 +103,24 @@ impl Read for ArcSlice<'_> {
 }
 
 impl<'a> ArcSlice<'a> {
+    /// Returns the underlying data with lifetime `'a`.
+    ///
+    /// Unlike `Deref::deref` (which returns `&[u8]` tied to `&self`), this method
+    /// returns `&'a [u8]` — the full lifetime of the backing data.
+    ///
+    /// # Safety (internal)
+    ///
+    /// For `Borrowed(&'a [u8])`, the data trivially lives for `'a`.
+    /// For `Owned`, the data lives as long as the `Arc` — callers keep the `ArcSlice`
+    /// (and thus the Arc) alive at least as long as they use the returned reference,
+    /// so this is sound even though we don't require `&'a self`.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        match self {
+            ArcSlice::Borrowed(slice) => slice,
+            ArcSlice::Owned { data, .. } => unsafe { &**data },
+        }
+    }
+
     /// Returns a new `ArcSlice` that points to a sub-range of the current slice.
     pub fn slice(self, range: Range<usize>) -> ArcSlice<'a> {
         match self {

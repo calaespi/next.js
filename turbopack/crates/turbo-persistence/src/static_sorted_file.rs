@@ -238,18 +238,9 @@ impl StaticSortedFile {
         value_block_cache: &BlockCache,
     ) -> Result<SstLookupResult<'a>> {
         let hash_len: u8 = if has_hash { 8 } else { 0 };
-        // SAFETY: For Borrowed, the data is 'a (from mmap). For Owned, the data is
-        // valid as long as the Arc inside key_block_arc, which we keep alive below.
-        // We need 'a lifetime here so that returned references (e.g. inline values)
-        // can be converted into ArcSlice<'a> via slice_from_subslice.
-        let block_data: &'a [u8] = unsafe { &*((&*key_block_arc) as *const [u8]) };
-        // skip block type byte (already read by caller)
-        let mut block = &block_data[1..];
-        // read entry count
-        let entry_count = block.read_u24::<BE>()? as usize;
-        // block now points past the 4-byte header
-        let offsets = &block[..entry_count * 4];
-        let entries = &block[entry_count * 4..];
+        // skip block type byte (already read by caller), read entry count
+        let mut header = &key_block_arc.as_bytes()[1..];
+        let entry_count = header.read_u24::<BE>()? as usize;
 
         let mut l = 0;
         let mut r = entry_count;
@@ -261,7 +252,7 @@ impl StaticSortedFile {
                 key: mid_key,
                 ty,
                 val: mid_val,
-            } = get_key_entry(offsets, entries, entry_count, m, hash_len)?;
+            } = get_key_entry(&key_block_arc, entry_count, m, hash_len)?;
 
             let comparison = compare_hash_key(mid_hash, mid_key, key_hash, key);
 
@@ -480,8 +471,7 @@ pub struct StaticSortedFileIter<'l> {
 }
 
 struct CurrentKeyBlock<'l> {
-    offsets: ArcSlice<'l>,
-    entries: ArcSlice<'l>,
+    block: ArcSlice<'l>,
     entry_count: usize,
     index: usize,
     hash_len: u8,
@@ -521,13 +511,8 @@ impl<'l> StaticSortedFileIter<'l> {
                 let has_hash = block_type == BLOCK_TYPE_KEY_WITH_HASH;
                 let hash_len = if has_hash { 8 } else { 0 };
                 let entry_count = block.read_u24::<BE>()? as usize;
-                let offsets_range = 4..4 + entry_count * 4;
-                let entries_range = 4 + entry_count * 4..block_arc.len();
-                let offsets = block_arc.clone().slice(offsets_range);
-                let entries = block_arc.slice(entries_range);
                 self.current_key_block = Some(CurrentKeyBlock {
-                    offsets,
-                    entries,
+                    block: block_arc,
                     entry_count,
                     index: 0,
                     hash_len,
@@ -544,20 +529,14 @@ impl<'l> StaticSortedFileIter<'l> {
     fn next_internal(&mut self) -> Result<Option<LookupEntry<'l>>> {
         loop {
             if let Some(CurrentKeyBlock {
-                offsets,
-                entries,
+                block: key_block,
                 entry_count,
                 index,
                 hash_len,
             }) = self.current_key_block.take()
             {
-                // SAFETY: For Borrowed, the data is 'l (from mmap). For Owned, the data is
-                // valid as long as the Arc inside entries, which we keep alive (either moved
-                // back into CurrentKeyBlock, or via the returned LookupEntry's ArcSlice).
-                let entries_data: &'l [u8] = unsafe { &*((&*entries) as *const [u8]) };
-                let offsets_data: &'l [u8] = unsafe { &*((&*offsets) as *const [u8]) };
                 let GetKeyEntryResult { hash, key, ty, val } =
-                    get_key_entry(offsets_data, entries_data, entry_count, index, hash_len)?;
+                    get_key_entry(&key_block, entry_count, index, hash_len)?;
                 // Convert hash slice to u64, computing from key if no hash stored
                 let full_hash = if hash.is_empty() {
                     crate::key::hash_key(&key)
@@ -566,8 +545,8 @@ impl<'l> StaticSortedFileIter<'l> {
                 };
                 let value = if ty == KEY_BLOCK_ENTRY_TYPE_MEDIUM {
                     let mut val = val;
-                    let block = val.read_u16::<BE>()?;
-                    let (uncompressed_size, block) = self.this.get_compressed_block(block)?;
+                    let block_idx = val.read_u16::<BE>()?;
+                    let (uncompressed_size, block) = self.this.get_compressed_block(block_idx)?;
                     LazyLookupValue::Medium {
                         uncompressed_size,
                         block,
@@ -575,19 +554,18 @@ impl<'l> StaticSortedFileIter<'l> {
                 } else {
                     let value =
                         self.this
-                            .handle_key_match(ty, val, &entries, self.value_block_cache)?;
+                            .handle_key_match(ty, val, &key_block, self.value_block_cache)?;
                     LazyLookupValue::Eager(value)
                 };
                 let entry = LookupEntry {
                     hash: full_hash,
-                    // SAFETY: key points into entries which is backed by the same Arc/mmap
-                    key: unsafe { entries.slice_from_subslice(key) },
+                    // SAFETY: key points into key_block's backing data
+                    key: unsafe { key_block.slice_from_subslice(key) },
                     value,
                 };
                 if index + 1 < entry_count {
                     self.current_key_block = Some(CurrentKeyBlock {
-                        offsets,
-                        entries,
+                        block: key_block,
                         entry_count,
                         index: index + 1,
                         hash_len,
@@ -665,13 +643,20 @@ fn entry_val_size(ty: u8) -> Result<usize> {
 }
 
 /// Reads a key entry from a key block.
+///
+/// Takes the whole key block `ArcSlice` and uses `as_bytes()` to obtain `&'l [u8]`
+/// with the full backing lifetime, avoiding unsafe lifetime extensions at call sites.
+/// The block layout is: `[type(1)][entry_count(3)][offsets(entry_count*4)][entries(...)]`.
 fn get_key_entry<'l>(
-    offsets: &[u8],
-    entries: &'l [u8],
+    block: &ArcSlice<'l>,
     entry_count: usize,
     index: usize,
     hash_len: u8,
 ) -> Result<GetKeyEntryResult<'l>> {
+    let data = block.as_bytes();
+    // Skip the 4-byte header (1 byte type + 3 byte entry count)
+    let offsets = &data[4..4 + entry_count * 4];
+    let entries = &data[4 + entry_count * 4..];
     let hash_len_usize = hash_len as usize;
     let mut offset = &offsets[index * 4..];
     let ty = offset.read_u8()?;
