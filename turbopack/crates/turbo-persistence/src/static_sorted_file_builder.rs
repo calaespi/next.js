@@ -302,15 +302,18 @@ impl<'l> BlockWriter<'l> {
     }
 
     fn write_block(&mut self, block: &[u8], compression: CompressionConfig<'_>) -> Result<()> {
-        let uncompressed_size: u32 = block.len().try_into().unwrap();
-
         let (uncompressed_size, data_to_write): (u32, &[u8]) = match compression {
             CompressionConfig::TryCompress { dict, long_term } => {
                 self.compress_block_into_buffer(block, dict, long_term)?;
-
-                if self.buffer.len() < block.len() {
+                // Same threshold as LevelDB/RocksDB: require at least 12.5% savings to store
+                // compressed.
+                // See https://github.com/google/leveldb/blob/ac691084fdc5546421a55b25e7653d450e5a25fb/table/table_builder.cc#L164
+                // Uncompressed blocks take more time to read but we can directly leverage the mmap
+                // on the read side, compressed blocks need to be decompressed and managed in a
+                // cache. So we should only do it if we expect to save time.
+                if self.buffer.len() < block.len() - (block.len() / 8) {
                     // Compression helped - use compressed data
-                    (uncompressed_size, self.buffer.as_slice())
+                    (block.len().try_into().unwrap(), self.buffer.as_slice())
                 } else {
                     // Compression didn't help - use uncompressed with sentinel size value
                     (0, block)
