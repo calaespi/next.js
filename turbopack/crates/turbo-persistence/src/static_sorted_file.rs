@@ -4,6 +4,7 @@ use std::{
     hash::BuildHasherDefault,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -46,15 +47,15 @@ const _: () = assert!(
 );
 
 /// The result of a lookup operation.
-pub enum SstLookupResult {
+pub enum SstLookupResult<'a> {
     /// The key was found.
-    Found(LookupValue),
+    Found(LookupValue<'a>),
     /// The key was not found.
     NotFound,
 }
 
-impl From<LookupValue> for SstLookupResult {
-    fn from(value: LookupValue) -> Self {
+impl<'a> From<LookupValue<'a>> for SstLookupResult<'a> {
+    fn from(value: LookupValue<'a>) -> Self {
         SstLookupResult::Found(value)
     }
 }
@@ -62,14 +63,14 @@ impl From<LookupValue> for SstLookupResult {
 #[derive(Clone, Default)]
 pub struct BlockWeighter;
 
-impl quick_cache::Weighter<(u32, u16), ArcSlice<u8>> for BlockWeighter {
-    fn weight(&self, _key: &(u32, u16), val: &ArcSlice<u8>) -> u64 {
+impl quick_cache::Weighter<(u32, u16), Arc<[u8]>> for BlockWeighter {
+    fn weight(&self, _key: &(u32, u16), val: &Arc<[u8]>) -> u64 {
         val.len() as u64 + 8
     }
 }
 
 pub type BlockCache =
-    quick_cache::sync::Cache<(u32, u16), ArcSlice<u8>, BlockWeighter, BuildHasherDefault<FxHasher>>;
+    quick_cache::sync::Cache<(u32, u16), Arc<[u8]>, BlockWeighter, BuildHasherDefault<FxHasher>>;
 
 #[derive(Clone, Debug)]
 pub struct StaticSortedFileMetaData {
@@ -148,20 +149,21 @@ impl StaticSortedFile {
     }
 
     /// Looks up a key in this file.
-    pub fn lookup<K: QueryKey>(
-        &self,
+    pub fn lookup<'a, K: QueryKey>(
+        &'a self,
         key_hash: u64,
         key: &K,
         key_block_cache: &BlockCache,
         value_block_cache: &BlockCache,
-    ) -> Result<SstLookupResult> {
+    ) -> Result<SstLookupResult<'a>> {
         let mut current_block = self.meta.block_count - 1;
         loop {
-            let mut key_block_arc = self.get_key_block(current_block, key_block_cache)?;
-            let block_type = key_block_arc.read_u8()?;
+            let key_block_arc = self.get_key_block(current_block, key_block_cache)?;
+            let mut block = &*key_block_arc;
+            let block_type = block.read_u8()?;
             match block_type {
                 BLOCK_TYPE_INDEX => {
-                    current_block = self.lookup_index_block(&key_block_arc, key_hash)?;
+                    current_block = self.lookup_index_block(block, key_hash)?;
                 }
                 BLOCK_TYPE_KEY_WITH_HASH | BLOCK_TYPE_KEY_NO_HASH => {
                     let has_hash = block_type == BLOCK_TYPE_KEY_WITH_HASH;
@@ -227,16 +229,25 @@ impl StaticSortedFile {
     }
 
     /// Looks up a key in a key block and the value in a value block.
-    fn lookup_key_block<K: QueryKey>(
-        &self,
-        mut block: ArcSlice<u8>,
+    fn lookup_key_block<'a, K: QueryKey>(
+        &'a self,
+        key_block_arc: ArcSlice<'a>,
         key_hash: u64,
         key: &K,
         has_hash: bool,
         value_block_cache: &BlockCache,
-    ) -> Result<SstLookupResult> {
+    ) -> Result<SstLookupResult<'a>> {
         let hash_len: u8 = if has_hash { 8 } else { 0 };
+        // SAFETY: For Borrowed, the data is 'a (from mmap). For Owned, the data is
+        // valid as long as the Arc inside key_block_arc, which we keep alive below.
+        // We need 'a lifetime here so that returned references (e.g. inline values)
+        // can be converted into ArcSlice<'a> via slice_from_subslice.
+        let block_data: &'a [u8] = unsafe { &*((&*key_block_arc) as *const [u8]) };
+        // skip block type byte (already read by caller)
+        let mut block = &block_data[1..];
+        // read entry count
         let entry_count = block.read_u24::<BE>()? as usize;
+        // block now points past the 4-byte header
         let offsets = &block[..entry_count * 4];
         let entries = &block[entry_count * 4..];
 
@@ -260,7 +271,7 @@ impl StaticSortedFile {
                 }
                 Ordering::Equal => {
                     return Ok(self
-                        .handle_key_match(ty, mid_val, &block, value_block_cache)?
+                        .handle_key_match(ty, mid_val, &key_block_arc, value_block_cache)?
                         .into());
                 }
                 Ordering::Greater => {
@@ -272,13 +283,13 @@ impl StaticSortedFile {
     }
 
     /// Handles a key match by looking up the value.
-    fn handle_key_match(
-        &self,
+    fn handle_key_match<'a>(
+        &'a self,
         ty: u8,
-        mut val: &[u8],
-        key_block_arc: &ArcSlice<u8>,
+        mut val: &'a [u8],
+        key_block_arc: &ArcSlice<'a>,
         value_block_cache: &BlockCache,
-    ) -> Result<LookupValue> {
+    ) -> Result<LookupValue<'a>> {
         Ok(match ty {
             KEY_BLOCK_ENTRY_TYPE_SMALL => {
                 let block = val.read_u16::<BE>()?;
@@ -309,75 +320,92 @@ impl StaticSortedFile {
     }
 
     /// Gets a key block from the cache or reads it from the file.
-    fn get_key_block(
-        &self,
+    /// For uncompressed blocks, returns a borrowed slice into the mmap.
+    /// For compressed blocks, returns an owned slice from the cache.
+    fn get_key_block<'a>(
+        &'a self,
         block: u16,
         key_block_cache: &BlockCache,
-    ) -> Result<ArcSlice<u8>, anyhow::Error> {
+    ) -> Result<ArcSlice<'a>> {
+        let (uncompressed_length, raw_block) = self.get_compressed_block(block)?;
+        if uncompressed_length == 0 {
+            // Uncompressed — return a zero-copy borrowed slice from the mmap
+            Ok(ArcSlice::Borrowed(raw_block))
+        } else {
+            // Compressed — use the cache
+            Ok(ArcSlice::from(self.get_or_decompress_block(
+                block,
+                uncompressed_length,
+                raw_block,
+                Some(&self.mmap[self.meta.key_compression_dictionary_range()]),
+                false,
+                key_block_cache,
+            )?))
+        }
+    }
+
+    /// Gets a value block from the cache or reads it from the file.
+    fn get_value_block<'a>(
+        &'a self,
+        block: u16,
+        value_block_cache: &BlockCache,
+    ) -> Result<ArcSlice<'a>> {
+        let (uncompressed_length, raw_block) = self.get_compressed_block(block)?;
+        if uncompressed_length == 0 {
+            Ok(ArcSlice::Borrowed(raw_block))
+        } else {
+            Ok(ArcSlice::from(self.get_or_decompress_block(
+                block,
+                uncompressed_length,
+                raw_block,
+                None,
+                false,
+                value_block_cache,
+            )?))
+        }
+    }
+
+    /// Reads a value block from the file (medium values, not cached).
+    fn read_value_block(&self, block_index: u16) -> Result<ArcSlice<'_>> {
+        let (uncompressed_length, block) = self.get_compressed_block(block_index)?;
+        if uncompressed_length == 0 {
+            Ok(ArcSlice::Borrowed(block))
+        } else {
+            Ok(ArcSlice::from(decompress_into_arc(
+                uncompressed_length,
+                block,
+                None,
+                true,
+            )?))
+        }
+    }
+
+    /// Gets a decompressed block from the cache or decompresses it.
+    fn get_or_decompress_block(
+        &self,
+        block_index: u16,
+        uncompressed_length: u32,
+        compressed_block: &[u8],
+        compression_dictionary: Option<&[u8]>,
+        long_term: bool,
+        cache: &BlockCache,
+    ) -> Result<Arc<[u8]>> {
         Ok(
-            match key_block_cache.get_value_or_guard(&(self.meta.sequence_number, block), None) {
-                GuardResult::Value(block) => block,
+            match cache.get_value_or_guard(&(self.meta.sequence_number, block_index), None) {
+                GuardResult::Value(arc) => arc,
                 GuardResult::Guard(guard) => {
-                    let block = self.read_key_block(block)?;
-                    let _ = guard.insert(block.clone());
-                    block
+                    let arc = decompress_into_arc(
+                        uncompressed_length,
+                        compressed_block,
+                        compression_dictionary,
+                        long_term,
+                    )?;
+                    let _ = guard.insert(arc.clone());
+                    arc
                 }
                 GuardResult::Timeout => unreachable!(),
             },
         )
-    }
-
-    /// Gets a value block from the cache or reads it from the file.
-    fn get_value_block(&self, block: u16, value_block_cache: &BlockCache) -> Result<ArcSlice<u8>> {
-        let block =
-            match value_block_cache.get_value_or_guard(&(self.meta.sequence_number, block), None) {
-                GuardResult::Value(block) => block,
-                GuardResult::Guard(guard) => {
-                    let block = self.read_small_value_block(block)?;
-                    let _ = guard.insert(block.clone());
-                    block
-                }
-                GuardResult::Timeout => unreachable!(),
-            };
-        Ok(block)
-    }
-
-    /// Reads a key block from the file.
-    fn read_key_block(&self, block_index: u16) -> Result<ArcSlice<u8>> {
-        self.read_block(
-            block_index,
-            Some(&self.mmap[self.meta.key_compression_dictionary_range()]),
-            false,
-        )
-    }
-
-    /// Reads a value block from the file.
-    fn read_small_value_block(&self, block_index: u16) -> Result<ArcSlice<u8>> {
-        self.read_block(block_index, None, false)
-    }
-
-    /// Reads a value block from the file.
-    fn read_value_block(&self, block_index: u16) -> Result<ArcSlice<u8>> {
-        self.read_block(block_index, None, true)
-    }
-
-    /// Reads a block from the file.
-    #[tracing::instrument(level = "info", name = "reading database block", skip_all)]
-    fn read_block(
-        &self,
-        block_index: u16,
-        compression_dictionary: Option<&[u8]>,
-        long_term: bool,
-    ) -> Result<ArcSlice<u8>> {
-        let (uncompressed_length, block) = self.get_compressed_block(block_index)?;
-
-        let buffer = decompress_into_arc(
-            uncompressed_length,
-            block,
-            compression_dictionary,
-            long_term,
-        )?;
-        Ok(ArcSlice::from(buffer))
     }
 
     /// Gets the slice of the compressed block from the memory mapped file.
@@ -447,20 +475,20 @@ pub struct StaticSortedFileIter<'l> {
     key_block_cache: &'l BlockCache,
     value_block_cache: &'l BlockCache,
 
-    stack: Vec<CurrentIndexBlock>,
-    current_key_block: Option<CurrentKeyBlock>,
+    stack: Vec<CurrentIndexBlock<'l>>,
+    current_key_block: Option<CurrentKeyBlock<'l>>,
 }
 
-struct CurrentKeyBlock {
-    offsets: ArcSlice<u8>,
-    entries: ArcSlice<u8>,
+struct CurrentKeyBlock<'l> {
+    offsets: ArcSlice<'l>,
+    entries: ArcSlice<'l>,
     entry_count: usize,
     index: usize,
     hash_len: u8,
 }
 
-struct CurrentIndexBlock {
-    entries: ArcSlice<u8>,
+struct CurrentIndexBlock<'l> {
+    entries: ArcSlice<'l>,
     block_indices_count: usize,
     index: usize,
 }
@@ -523,8 +551,13 @@ impl<'l> StaticSortedFileIter<'l> {
                 hash_len,
             }) = self.current_key_block.take()
             {
+                // SAFETY: For Borrowed, the data is 'l (from mmap). For Owned, the data is
+                // valid as long as the Arc inside entries, which we keep alive (either moved
+                // back into CurrentKeyBlock, or via the returned LookupEntry's ArcSlice).
+                let entries_data: &'l [u8] = unsafe { &*((&*entries) as *const [u8]) };
+                let offsets_data: &'l [u8] = unsafe { &*((&*offsets) as *const [u8]) };
                 let GetKeyEntryResult { hash, key, ty, val } =
-                    get_key_entry(&offsets, &entries, entry_count, index, hash_len)?;
+                    get_key_entry(offsets_data, entries_data, entry_count, index, hash_len)?;
                 // Convert hash slice to u64, computing from key if no hash stored
                 let full_hash = if hash.is_empty() {
                     crate::key::hash_key(&key)
@@ -547,7 +580,7 @@ impl<'l> StaticSortedFileIter<'l> {
                 };
                 let entry = LookupEntry {
                     hash: full_hash,
-                    // SAFETY: key points into entries which is backed by the same Arc
+                    // SAFETY: key points into entries which is backed by the same Arc/mmap
                     key: unsafe { entries.slice_from_subslice(key) },
                     value,
                 };

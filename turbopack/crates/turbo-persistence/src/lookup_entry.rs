@@ -5,13 +5,13 @@ use crate::{
 };
 
 /// A value from a SST file lookup.
-pub enum LookupValue {
+pub enum LookupValue<'a> {
     /// The value was deleted.
     Deleted,
     /// The value is stored in the SST file.
     ///
     /// The ArcSlice will be pointing either at a keyblock or a value block in the SST
-    Slice { value: ArcSlice<u8> },
+    Slice { value: ArcSlice<'a> },
     /// The value is stored in a blob file.
     Blob { sequence_number: u32 },
 }
@@ -19,7 +19,7 @@ pub enum LookupValue {
 /// A value from a SST file lookup.
 pub enum LazyLookupValue<'l> {
     /// A LookupValue
-    Eager(LookupValue),
+    Eager(LookupValue<'l>),
     /// A medium sized value that is still compressed.
     Medium {
         uncompressed_size: u32,
@@ -46,7 +46,7 @@ pub struct LookupEntry<'l> {
     /// The hash of the key.
     pub hash: u64,
     /// The key.
-    pub key: ArcSlice<u8>,
+    pub key: ArcSlice<'l>,
     /// The value.
     pub value: LazyLookupValue<'l>,
 }

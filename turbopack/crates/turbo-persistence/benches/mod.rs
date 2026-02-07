@@ -1,4 +1,9 @@
-use std::{cell::UnsafeCell, path::Path, sync::LazyLock, time::Duration};
+use std::{
+    cell::UnsafeCell,
+    path::Path,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use anyhow::Result;
 use criterion::{
@@ -10,7 +15,7 @@ use quick_cache::sync::GuardResult;
 use rand::{Rng, SeedableRng, rngs::SmallRng, seq::SliceRandom};
 use tempfile::TempDir;
 use turbo_persistence::{
-    ArcSlice, BlockCache, CompactConfig, Entry, EntryValue, MetaEntryFlags, SerialScheduler,
+    BlockCache, CompactConfig, Entry, EntryValue, MetaEntryFlags, SerialScheduler,
     StaticSortedFile, StaticSortedFileMetaData, TurboPersistence, hash_key,
     write_static_stored_file,
 };
@@ -957,7 +962,7 @@ fn bench_block_cache(c: &mut Criterion) {
 
             let mut block_data = vec![0u8; BLOCK_SIZE];
             rng.fill(&mut block_data[..]);
-            let block = ArcSlice::from(block_data.into_boxed_slice());
+            let block: Arc<[u8]> = block_data.into_boxed_slice().into();
 
             // Create cache with enough capacity for all entries
             let cache: BlockCache = BlockCache::with(

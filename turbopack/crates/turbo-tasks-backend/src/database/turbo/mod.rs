@@ -71,7 +71,7 @@ impl KeyValueDatabase for TurboKeyValueDatabase {
     }
 
     type ValueBuffer<'l>
-        = ArcSlice<u8>
+        = ArcSlice<'static>
     where
         Self: 'l;
 
@@ -176,7 +176,7 @@ pub struct TurboWriteBatch<'a> {
 
 impl<'a> BaseWriteBatch<'a> for TurboWriteBatch<'a> {
     type ValueBuffer<'l>
-        = ArcSlice<u8>
+        = ArcSlice<'static>
     where
         Self: 'l,
         'a: 'l;

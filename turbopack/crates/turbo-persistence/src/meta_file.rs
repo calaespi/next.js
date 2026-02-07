@@ -165,7 +165,7 @@ impl MetaEntry {
 }
 
 /// The result of a lookup operation.
-pub enum MetaLookupResult {
+pub enum MetaLookupResult<'a> {
     /// The key was not found because it is from a different key family.
     FamilyMiss,
     /// The key was not found because it is out of the range of this SST file. But it was the
@@ -174,7 +174,7 @@ pub enum MetaLookupResult {
     /// The key was not found because it was not in the AMQF filter. But it was in the range.
     QuickFilterMiss,
     /// The key was looked up in the SST file. It was in the AMQF filter.
-    SstLookup(SstLookupResult),
+    SstLookup(SstLookupResult<'a>),
 }
 
 /// The result of a batch lookup operation.
@@ -373,14 +373,14 @@ impl MetaFile {
         &self.obsolete_sst_files
     }
 
-    pub fn lookup<K: QueryKey>(
-        &self,
+    pub fn lookup<'a, K: QueryKey>(
+        &'a self,
         key_family: u32,
         key_hash: u64,
         key: &K,
         key_block_cache: &BlockCache,
         value_block_cache: &BlockCache,
-    ) -> Result<MetaLookupResult> {
+    ) -> Result<MetaLookupResult<'a>> {
         if key_family != self.family {
             return Ok(MetaLookupResult::FamilyMiss);
         }
@@ -407,11 +407,11 @@ impl MetaFile {
         Ok(miss_result)
     }
 
-    pub fn batch_lookup<K: QueryKey>(
-        &self,
+    pub fn batch_lookup<'a, K: QueryKey>(
+        &'a self,
         key_family: u32,
         keys: &[K],
-        cells: &mut [(u64, usize, Option<LookupValue>)],
+        cells: &mut [(u64, usize, Option<LookupValue<'a>>)],
         empty_cells: &mut usize,
         key_block_cache: &BlockCache,
         value_block_cache: &BlockCache,

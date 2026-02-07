@@ -376,7 +376,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
 
     /// Reads and decompresses a blob file. This is not backed by any cache.
     #[tracing::instrument(level = "info", name = "reading database blob", skip_all)]
-    fn read_blob(&self, seq: u32) -> Result<ArcSlice<u8>> {
+    fn read_blob(&self, seq: u32) -> Result<ArcSlice<'static>> {
         let path = self.path.join(format!("{seq:08}.blob"));
         let mmap = unsafe { Mmap::map(&File::open(&path)?)? };
         #[cfg(unix)]
@@ -1346,7 +1346,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
 
     /// Get a value from the database. Returns None if the key is not found. The returned value
     /// might hold onto a block of the database and it should not be hold long-term.
-    pub fn get<K: QueryKey>(&self, family: usize, key: &K) -> Result<Option<ArcSlice<u8>>> {
+    pub fn get<K: QueryKey>(&self, family: usize, key: &K) -> Result<Option<ArcSlice<'static>>> {
         debug_assert!(family < FAMILIES, "Family index out of bounds");
         let span = tracing::trace_span!(
             "database read",
@@ -1390,7 +1390,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                                 #[cfg(feature = "stats")]
                                 self.stats.hits_small.fetch_add(1, Ordering::Relaxed);
                                 span.record("result_size", value.len());
-                                return Ok(Some(value));
+                                return Ok(Some(value.into_owned()));
                             }
                             LookupValue::Blob { sequence_number } => {
                                 #[cfg(feature = "stats")]
@@ -1418,7 +1418,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
         &self,
         family: usize,
         keys: &[K],
-    ) -> Result<Vec<Option<ArcSlice<u8>>>> {
+    ) -> Result<Vec<Option<ArcSlice<'static>>>> {
         debug_assert!(family < FAMILIES, "Family index out of bounds");
         let span = tracing::trace_span!(
             "database batch read",
@@ -1429,7 +1429,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
             result_size = tracing::field::Empty
         )
         .entered();
-        let mut cells: Vec<(u64, usize, Option<LookupValue>)> = Vec::with_capacity(keys.len());
+        let mut cells: Vec<(u64, usize, Option<LookupValue<'_>>)> = Vec::with_capacity(keys.len());
         let mut empty_cells = keys.len();
         for (index, key) in keys.iter().enumerate() {
             let hash = hash_key(key);
@@ -1498,7 +1498,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                         #[cfg(feature = "stats")]
                         self.stats.hits_small.fetch_add(1, Ordering::Relaxed);
                         result_size += value.len();
-                        Some(value)
+                        Some(value.into_owned())
                     }
                     LookupValue::Blob { sequence_number } => {
                         #[cfg(feature = "stats")]

@@ -255,8 +255,8 @@ impl<'l> BlockWriter<'l> {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    fn write_index_block(&mut self, block: &[u8], dict: &[u8]) -> Result<()> {
-        self.write_block(block, Some(dict), false)
+    fn write_index_block(&mut self, block: &[u8]) -> Result<()> {
+        self.write_uncompressed_block(block)
             .context("Failed to write index block")
     }
 
@@ -272,10 +272,44 @@ impl<'l> BlockWriter<'l> {
             .context("Failed to write value block")
     }
 
+    /// Writes a block without attempting compression. Used for index blocks.
+    fn write_uncompressed_block(&mut self, block: &[u8]) -> Result<()> {
+        let len: u32 = (block.len() + 4).try_into().unwrap();
+        let offset = self
+            .block_offsets
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .checked_add(len)
+            .expect("Block offset overflow");
+        self.block_offsets.push(offset);
+
+        // Header = 0 signals uncompressed
+        self.writer
+            .write_u32::<BE>(0)
+            .context("Failed to write block header")?;
+        self.writer
+            .write_all(block)
+            .context("Failed to write block data")?;
+        Ok(())
+    }
+
     fn write_block(&mut self, block: &[u8], dict: Option<&[u8]>, long_term: bool) -> Result<()> {
-        let uncompressed_size = block.len().try_into().unwrap();
+        let uncompressed_size: u32 = block.len().try_into().unwrap();
+
+        // Determine if we should write compressed or uncompressed
         self.compress_block_into_buffer(block, dict, long_term)?;
-        let len = (self.buffer.len() + 4).try_into().unwrap();
+
+        let (uncompressed_size, data_to_write): (u32, &[u8]) =
+        // Compression helped - use compressed data, this is the common case
+        if self.buffer.len() < block.len() {
+            (uncompressed_size, self.buffer.as_slice())
+        } else {
+            // Compression didn't help - use uncompressed with sentinel size value
+            (0, block)
+        };
+
+        let len: u32 = (data_to_write.len() + 4).try_into().unwrap();
         let offset = self
             .block_offsets
             .last()
@@ -287,10 +321,10 @@ impl<'l> BlockWriter<'l> {
 
         self.writer
             .write_u32::<BE>(uncompressed_size)
-            .context("Failed to write uncompressed size")?;
+            .context("Failed to write uncompressed_size")?;
         self.writer
-            .write_all(self.buffer)
-            .context("Failed to write compressed block")?;
+            .write_all(data_to_write)
+            .context("Failed to write block data")?;
         self.buffer.clear();
         Ok(())
     }
@@ -521,7 +555,7 @@ fn write_key_blocks_and_compute_amqf(
     }
     let _ = writer.next_block_index();
     index_block.finish();
-    writer.write_index_block(buffer, key_compression_dictionary)?;
+    writer.write_index_block(buffer)?;
     buffer.clear();
 
     Ok(turbo_bincode_encode(&AmqfBincodeWrapper(filter)).expect("AMQF serialization failed"))
