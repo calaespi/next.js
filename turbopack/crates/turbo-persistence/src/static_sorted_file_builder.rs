@@ -219,6 +219,16 @@ fn compute_key_compression_dictionary<E: Entry>(
     Ok(result)
 }
 
+enum CompressionConfig<'a> {
+    /// Attempt compression; use the result only if it's smaller than the original.
+    TryCompress {
+        dict: Option<&'a [u8]>,
+        long_term: bool,
+    },
+    /// Write the block uncompressed.
+    Uncompressed,
+}
+
 struct BlockWriter<'l> {
     buffer: &'l mut Vec<u8>,
     block_offsets: Vec<u32>,
@@ -250,63 +260,63 @@ impl<'l> BlockWriter<'l> {
 
     #[tracing::instrument(level = "trace", skip_all)]
     fn write_key_block(&mut self, block: &[u8], dict: &[u8]) -> Result<()> {
-        self.write_block(block, Some(dict), false)
-            .context("Failed to write key block")
+        self.write_block(
+            block,
+            CompressionConfig::TryCompress {
+                dict: Some(dict),
+                long_term: false,
+            },
+        )
+        .context("Failed to write key block")
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     fn write_index_block(&mut self, block: &[u8]) -> Result<()> {
-        self.write_uncompressed_block(block)
+        // Index blocks are minimally compressible so don't try
+        self.write_block(block, CompressionConfig::Uncompressed)
             .context("Failed to write index block")
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     fn write_small_value_block(&mut self, block: &[u8]) -> Result<()> {
-        self.write_block(block, None, false)
-            .context("Failed to write small value block")
+        self.write_block(
+            block,
+            CompressionConfig::TryCompress {
+                dict: None,
+                long_term: false,
+            },
+        )
+        .context("Failed to write small value block")
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     fn write_value_block(&mut self, block: &[u8]) -> Result<()> {
-        self.write_block(block, None, true)
-            .context("Failed to write value block")
+        self.write_block(
+            block,
+            CompressionConfig::TryCompress {
+                dict: None,
+                long_term: true,
+            },
+        )
+        .context("Failed to write value block")
     }
 
-    /// Writes a block without attempting compression. Used for index blocks.
-    fn write_uncompressed_block(&mut self, block: &[u8]) -> Result<()> {
-        let len: u32 = (block.len() + 4).try_into().unwrap();
-        let offset = self
-            .block_offsets
-            .last()
-            .copied()
-            .unwrap_or_default()
-            .checked_add(len)
-            .expect("Block offset overflow");
-        self.block_offsets.push(offset);
-
-        // Header = 0 signals uncompressed
-        self.writer
-            .write_u32::<BE>(0)
-            .context("Failed to write block header")?;
-        self.writer
-            .write_all(block)
-            .context("Failed to write block data")?;
-        Ok(())
-    }
-
-    fn write_block(&mut self, block: &[u8], dict: Option<&[u8]>, long_term: bool) -> Result<()> {
+    fn write_block(&mut self, block: &[u8], compression: CompressionConfig<'_>) -> Result<()> {
         let uncompressed_size: u32 = block.len().try_into().unwrap();
 
-        // Determine if we should write compressed or uncompressed
-        self.compress_block_into_buffer(block, dict, long_term)?;
+        let (uncompressed_size, data_to_write): (u32, &[u8]) = match compression {
+            CompressionConfig::TryCompress { dict, long_term } => {
+                self.compress_block_into_buffer(block, dict, long_term)?;
 
-        let (uncompressed_size, data_to_write): (u32, &[u8]) =
-        // Compression helped - use compressed data, this is the common case
-        if self.buffer.len() < block.len() {
-            (uncompressed_size, self.buffer.as_slice())
-        } else {
-            // Compression didn't help - use uncompressed with sentinel size value
-            (0, block)
+                if self.buffer.len() < block.len() {
+                    // Compression helped - use compressed data
+                    (uncompressed_size, self.buffer.as_slice())
+                } else {
+                    // Compression didn't help - use uncompressed with sentinel size value
+                    (0, block)
+                }
+            }
+            CompressionConfig::Uncompressed => (0, block),
         };
 
         let len: u32 = (data_to_write.len() + 4).try_into().unwrap();
