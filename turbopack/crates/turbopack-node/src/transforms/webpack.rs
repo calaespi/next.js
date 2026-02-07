@@ -45,8 +45,7 @@ use turbopack_core::{
 };
 use turbopack_ecmascript::chunk::EcmascriptChunkItem;
 use turbopack_resolve::{
-    ecmascript::get_condition_maps,
-    resolve::resolve_options,
+    ecmascript::get_condition_maps, resolve::resolve_options,
     resolve_options_context::ResolveOptionsContext,
 };
 
@@ -430,10 +429,7 @@ pub enum RequestMessage {
     #[serde(rename_all = "camelCase")]
     TrackFileRead { file: RcStr },
     #[serde(rename_all = "camelCase")]
-    ImportModule {
-        lookup_path: RcStr,
-        request: RcStr,
-    },
+    ImportModule { lookup_path: RcStr, request: RcStr },
 }
 
 #[derive(Serialize, Debug)]
@@ -449,7 +445,9 @@ pub struct ImportModuleItem {
 #[derive(Serialize, Debug)]
 #[serde(untagged)]
 pub enum ResponseMessage {
-    Resolve { path: RcStr },
+    Resolve {
+        path: RcStr,
+    },
     // Only used for tracking invalidations, no content is returned.
     TrackFileRead {},
     #[serde(rename_all = "camelCase")]
@@ -714,10 +712,9 @@ impl EvaluateContext for WebpackLoaderContext {
                 let import_mg_vc = *import_module_graph;
 
                 // Get the entry module's chunk item ID
-                let entry_chunkable =
-                    Vc::try_resolve_sidecast::<Box<dyn ChunkableModule>>(*module)
-                        .await?
-                        .context("importModule: entry module is not chunkable")?;
+                let entry_chunkable = Vc::try_resolve_sidecast::<Box<dyn ChunkableModule>>(*module)
+                    .await?
+                    .context("importModule: entry module is not chunkable")?;
                 let entry_chunk_item =
                     entry_chunkable.as_chunk_item(import_mg_vc, *self.chunking_context);
                 let entry_id: RcStr = entry_chunk_item.id().await?.to_string().into();
@@ -736,8 +733,7 @@ impl EvaluateContext for WebpackLoaderContext {
                         continue;
                     };
 
-                    let chunk_item =
-                        chunkable.as_chunk_item(import_mg_vc, *self.chunking_context);
+                    let chunk_item = chunkable.as_chunk_item(import_mg_vc, *self.chunking_context);
 
                     let Some(ecma_item) =
                         Vc::try_resolve_sidecast::<Box<dyn EcmascriptChunkItem>>(chunk_item)
