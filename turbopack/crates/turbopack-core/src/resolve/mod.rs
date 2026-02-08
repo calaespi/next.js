@@ -157,6 +157,8 @@ pub enum ImportUsage {
 #[derive(Debug, Clone, Default, Hash, Serialize, Deserialize)]
 pub enum ExportUsage {
     Named(RcStr),
+    /// Multiple named exports are used.
+    NamedSet(SmallVec<[RcStr; 1]>),
     /// This means the whole content of the module is used.
     #[default]
     All,
@@ -168,6 +170,16 @@ impl Display for ExportUsage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ExportUsage::Named(name) => write!(f, "export {name}"),
+            ExportUsage::NamedSet(names) => {
+                write!(f, "exports ")?;
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}")?;
+                }
+                Ok(())
+            }
             ExportUsage::All => write!(f, "all"),
             ExportUsage::Evaluation => write!(f, "evaluation"),
         }
