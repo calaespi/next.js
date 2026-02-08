@@ -1390,6 +1390,11 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                                 #[cfg(feature = "stats")]
                                 self.stats.hits_small.fetch_add(1, Ordering::Relaxed);
                                 span.record("result_size", value.len());
+                                // We need to potentially make a copy here so the data can escape
+                                // the read_lock Generally value
+                                // blocks are compressed so the only time this will copy is if the
+                                // value is small enough to be inlined in a key block, so the
+                                // allocation will be very small.
                                 return Ok(Some(value.into_owned()));
                             }
                             LookupValue::Blob { sequence_number } => {
