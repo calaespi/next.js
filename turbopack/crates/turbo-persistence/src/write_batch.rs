@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use thread_local::ThreadLocal;
 
 use crate::{
-    ValueBuffer,
+    FamilyConfig, ValueBuffer,
     collector::Collector,
     collector_entry::CollectorEntry,
     compression::compress_into_buffer,
@@ -71,6 +71,8 @@ pub struct WriteBatch<K: StoreKey + Send, S: ParallelScheduler, const FAMILIES: 
     parallel_scheduler: S,
     /// The database path
     db_path: PathBuf,
+    /// Per-family configuration (kind: SingleValue/MultiValue).
+    family_configs: [FamilyConfig; FAMILIES],
     /// The current sequence number counter. Increased for every new SST file or blob file.
     current_sequence_number: AtomicU32,
     /// The thread local state.
@@ -87,14 +89,20 @@ pub struct WriteBatch<K: StoreKey + Send, S: ParallelScheduler, const FAMILIES: 
 impl<K: StoreKey + Send + Sync, S: ParallelScheduler, const FAMILIES: usize>
     WriteBatch<K, S, FAMILIES>
 {
-    /// Creates a new write batch for a database.
-    pub(crate) fn new(path: PathBuf, current: u32, parallel_scheduler: S) -> Self {
+    /// Creates a new write batch for a database with per-family configuration.
+    pub(crate) fn new(
+        path: PathBuf,
+        current: u32,
+        parallel_scheduler: S,
+        family_configs: [FamilyConfig; FAMILIES],
+    ) -> Self {
         const {
             assert!(FAMILIES <= usize_from_u32(u32::MAX));
         };
         Self {
             parallel_scheduler,
             db_path: path,
+            family_configs,
             current_sequence_number: AtomicU32::new(current),
             thread_locals: ThreadLocal::new(),
             collectors: [(); FAMILIES]
@@ -195,7 +203,8 @@ impl<K: StoreKey + Send + Sync, S: ParallelScheduler, const FAMILIES: usize>
         // driving the work to slow down task submission in this case.
         for mut global_collector in full_collectors {
             // When the global collector is full, we create a new SST file.
-            let sst = self.create_sst_file(family, global_collector.sorted())?;
+            let kind = self.family_configs[usize_from_u32(family)].kind;
+            let sst = self.create_sst_file(family, global_collector.sorted(kind))?;
             self.new_sst_files.lock().push(sst);
             drop(global_collector);
         }
@@ -256,7 +265,8 @@ impl<K: StoreKey + Send + Sync, S: ParallelScheduler, const FAMILIES: usize>
         match &mut *collector_state {
             GlobalCollectorState::Unsharded(collector) => {
                 if !collector.is_empty() {
-                    let sst = self.create_sst_file(family, collector.sorted())?;
+                    let kind = self.family_configs[usize_from_u32(family)].kind;
+                    let sst = self.create_sst_file(family, collector.sorted(kind))?;
                     collector.clear();
                     self.new_sst_files.lock().push(sst);
                 }
@@ -268,10 +278,11 @@ impl<K: StoreKey + Send + Sync, S: ParallelScheduler, const FAMILIES: usize>
                 ) else {
                     unreachable!();
                 };
+                let kind = self.family_configs[usize_from_u32(family)].kind;
                 self.parallel_scheduler
                     .try_parallel_for_each_mut(&mut shards, |collector| {
                         if !collector.is_empty() {
-                            let sst = self.create_sst_file(family, collector.sorted())?;
+                            let sst = self.create_sst_file(family, collector.sorted(kind))?;
                             collector.clear();
                             self.new_sst_files.lock().push(sst);
                             collector.drop_contents();
@@ -356,7 +367,8 @@ impl<K: StoreKey + Send + Sync, S: ParallelScheduler, const FAMILIES: usize>
             |(family, mut collector)| {
                 let family = family as u32;
                 if !collector.is_empty() {
-                    let sst = self.create_sst_file(family, collector.sorted())?;
+                    let kind = self.family_configs[usize_from_u32(family)].kind;
+                    let sst = self.create_sst_file(family, collector.sorted(kind))?;
                     collector.clear();
                     drop(collector);
                     shared_new_sst_files.lock().push(sst);
@@ -485,22 +497,27 @@ impl<K: StoreKey + Send + Sync, S: ParallelScheduler, const FAMILIES: usize>
             for entry in entries {
                 entry.write_key_to(&mut key_buf);
                 let result = sst
-                    .lookup(hash_key(&key_buf), &key_buf, &cache2, &cache3)
+                    .lookup::<_, false>(hash_key(&key_buf), &key_buf, &cache2, &cache3)
                     .expect("key found");
                 key_buf.clear();
                 match result {
-                    SstLookupResult::Found(LookupValue::Deleted) => {}
-                    SstLookupResult::Found(LookupValue::Slice {
-                        value: lookup_value,
-                    }) => {
-                        let expected_value_slice = match &entry.value {
-                            CollectorEntryValue::Small { value } => &**value,
-                            CollectorEntryValue::Medium { value } => &**value,
-                            _ => panic!("Unexpected value"),
-                        };
-                        assert_eq!(*lookup_value, *expected_value_slice);
+                    SstLookupResult::Found(mut values) => {
+                        debug_assert!(values.len() == 1);
+                        match values.pop().unwrap() {
+                            LookupValue::Deleted => {}
+                            LookupValue::Slice {
+                                value: lookup_value,
+                            } => {
+                                let expected_value_slice = match &entry.value {
+                                    CollectorEntryValue::Small { value } => &**value,
+                                    CollectorEntryValue::Medium { value } => &**value,
+                                    _ => panic!("Unexpected value"),
+                                };
+                                assert_eq!(*lookup_value, *expected_value_slice);
+                            }
+                            LookupValue::Blob { sequence_number: _ } => {}
+                        }
                     }
-                    SstLookupResult::Found(LookupValue::Blob { sequence_number: _ }) => {}
                     SstLookupResult::NotFound => panic!("All keys must exist"),
                 }
             }

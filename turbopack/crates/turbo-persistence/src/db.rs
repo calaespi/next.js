@@ -17,10 +17,11 @@ use memmap2::Mmap;
 use nohash_hasher::BuildNoHashHasher;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
+use tracing::span::EnteredSpan;
 
 pub use crate::compaction::selector::CompactConfig;
 use crate::{
-    QueryKey,
+    DbConfig, FamilyKind, QueryKey,
     arc_slice::ArcSlice,
     compaction::selector::{Compactable, get_merge_segments},
     compression::decompress_into_arc,
@@ -121,6 +122,8 @@ pub struct TurboPersistence<S: ParallelScheduler, const FAMILIES: usize> {
     key_block_cache: BlockCache,
     /// A cache for decompressed value blocks.
     value_block_cache: BlockCache,
+    /// Per-family configuration for file limits.
+    config: DbConfig<FAMILIES>,
     /// Statistics for the database.
     #[cfg(feature = "stats")]
     stats: TrackedStats,
@@ -157,6 +160,11 @@ impl<S: ParallelScheduler + Default, const FAMILIES: usize> TurboPersistence<S, 
         Self::open_with_parallel_scheduler(path, Default::default())
     }
 
+    /// Open a TurboPersistence database at the given path with custom per-family configuration.
+    pub fn open_with_config(path: PathBuf, config: DbConfig<FAMILIES>) -> Result<Self> {
+        Self::open_with_config_and_parallel_scheduler(path, config, Default::default())
+    }
+
     /// Open a TurboPersistence database at the given path in read only mode.
     /// This will read the directory. No Cleanup is performed.
     pub fn open_read_only(path: PathBuf) -> Result<Self> {
@@ -165,7 +173,12 @@ impl<S: ParallelScheduler + Default, const FAMILIES: usize> TurboPersistence<S, 
 }
 
 impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> {
-    fn new(path: PathBuf, read_only: bool, parallel_scheduler: S) -> Self {
+    fn new(
+        path: PathBuf,
+        read_only: bool,
+        parallel_scheduler: S,
+        config: DbConfig<FAMILIES>,
+    ) -> Self {
         Self {
             parallel_scheduler,
             path,
@@ -191,6 +204,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                 Default::default(),
                 Default::default(),
             ),
+            config,
             #[cfg(feature = "stats")]
             stats: TrackedStats::default(),
         }
@@ -201,7 +215,16 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
     /// properly. Cleanup only requires to read a few bytes from a few files and to delete
     /// files, so it's fast.
     pub fn open_with_parallel_scheduler(path: PathBuf, parallel_scheduler: S) -> Result<Self> {
-        let mut db = Self::new(path, false, parallel_scheduler);
+        Self::open_with_config_and_parallel_scheduler(path, DbConfig::default(), parallel_scheduler)
+    }
+
+    /// Open a TurboPersistence database at the given path with custom per-family configuration.
+    pub fn open_with_config_and_parallel_scheduler(
+        path: PathBuf,
+        config: DbConfig<FAMILIES>,
+        parallel_scheduler: S,
+    ) -> Result<Self> {
+        let mut db = Self::new(path, false, parallel_scheduler, config);
         db.open_directory(false)?;
         Ok(db)
     }
@@ -212,7 +235,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
         path: PathBuf,
         parallel_scheduler: S,
     ) -> Result<Self> {
-        let mut db = Self::new(path, true, parallel_scheduler);
+        let mut db = Self::new(path, true, parallel_scheduler, DbConfig::default());
         db.open_directory(false)?;
         Ok(db)
     }
@@ -422,6 +445,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
             self.path.clone(),
             current,
             self.parallel_scheduler.clone(),
+            self.config.family_configs,
         ))
     }
 
@@ -956,6 +980,13 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                         .map(|index| ssts_with_ranges[index].seq)
                         .collect::<Vec<_>>();
 
+                    // Check if all SSTs for this family are covered by merge
+                    // segments. If so, tombstones can be dropped during
+                    // compaction since there are no un-merged SSTs.
+                    let total_merged_ssts: usize =
+                        merge_jobs.iter().map(|segment| segment.len()).sum();
+                    let can_drop_tombstones = total_merged_ssts == ssts_with_ranges.len();
+
                     // Merge SST files
                     let span = tracing::trace_span!("merge files");
                     enum PartialMergeResult<'l> {
@@ -963,7 +994,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                             new_sst_files: Vec<(u32, File, StaticSortedFileBuilderMeta<'static>)>,
                             blob_seq_numbers_to_delete: Vec<u32>,
                             keys_written: u64,
-                            indicies: SmallVec<[usize; 1]>,
+                            indices: SmallVec<[usize; 1]>,
                         },
                         Move {
                             seq: u32,
@@ -972,246 +1003,470 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                     }
                     let merge_result = self
                         .parallel_scheduler
-                        .parallel_map_collect_owned::<_, _, Result<Vec<_>>>(
-                            merge_jobs,
-                            |indicies| {
-                                let _span = span.clone().entered();
-                                if indicies.len() == 1 {
-                                    // If we only have one file, we can just move it
-                                    let index = indicies[0];
+                        .parallel_map_collect_owned::<_, _, Result<Vec<_>>>(merge_jobs, |indices| {
+                            let _span = span.clone().entered();
+                            if indices.len() == 1 {
+                                // If we only have one file, we can just move it
+                                let index = indices[0];
+                                let meta_index = ssts_with_ranges[index].meta_index;
+                                let index_in_meta = ssts_with_ranges[index].index_in_meta;
+                                let meta_file = &meta_files[meta_index];
+                                let entry = meta_file.entry(index_in_meta);
+                                let amqf = Cow::Borrowed(entry.raw_amqf(meta_file.amqf_data()));
+                                let meta = StaticSortedFileBuilderMeta {
+                                    min_hash: entry.min_hash(),
+                                    max_hash: entry.max_hash(),
+                                    amqf,
+                                    key_compression_dictionary_length: entry
+                                        .key_compression_dictionary_length(),
+                                    block_count: entry.block_count(),
+                                    size: entry.size(),
+                                    flags: entry.flags(),
+                                    entries: 0,
+                                };
+                                return Ok(PartialMergeResult::Move {
+                                    seq: entry.sequence_number(),
+                                    meta,
+                                });
+                            }
+
+                            fn create_sst_file<'l, S: ParallelScheduler>(
+                                parallel_scheduler: &S,
+                                entries: &[LookupEntry<'l>],
+                                total_key_size: usize,
+                                path: &Path,
+                                seq: u32,
+                                flags: MetaEntryFlags,
+                            ) -> Result<(u32, File, StaticSortedFileBuilderMeta<'static>)>
+                            {
+                                let _span = tracing::trace_span!("write merged sst file").entered();
+                                let (meta, file) = parallel_scheduler.block_in_place(|| {
+                                    write_static_stored_file(
+                                        entries,
+                                        total_key_size,
+                                        &path.join(format!("{seq:08}.sst")),
+                                        flags,
+                                    )
+                                })?;
+                                Ok((seq, file, meta))
+                            }
+
+                            // Build a mapping from merge iterator order → SST
+                            // sequence number, so we can determine temporal
+                            // ordering during tombstone processing.
+                            let order_to_seq: Vec<u32> = indices
+                                .iter()
+                                .map(|&index| ssts_with_ranges[index].seq)
+                                .collect();
+
+                            // Iterate all SST files
+                            let iters = indices
+                                .iter()
+                                .map(|&index| {
                                     let meta_index = ssts_with_ranges[index].meta_index;
                                     let index_in_meta = ssts_with_ranges[index].index_in_meta;
-                                    let meta_file = &meta_files[meta_index];
-                                    let entry = meta_file.entry(index_in_meta);
-                                    let amqf = Cow::Borrowed(entry.raw_amqf(meta_file.amqf_data()));
-                                    let meta = StaticSortedFileBuilderMeta {
-                                        min_hash: entry.min_hash(),
-                                        max_hash: entry.max_hash(),
-                                        amqf,
-                                        key_compression_dictionary_length: entry
-                                            .key_compression_dictionary_length(),
-                                        block_count: entry.block_count(),
-                                        size: entry.size(),
-                                        flags: entry.flags(),
-                                        entries: 0,
-                                    };
-                                    return Ok(PartialMergeResult::Move {
-                                        seq: entry.sequence_number(),
-                                        meta,
+                                    let meta = &meta_files[meta_index];
+                                    meta.entry(index_in_meta)
+                                        .sst(meta)?
+                                        .iter(key_block_cache, value_block_cache)
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+
+                            let iter = MergeIter::new(iters.into_iter())?;
+
+                            // TODO figure out how to delete blobs when they are no longer
+                            // referenced
+                            let blob_seq_numbers_to_delete: Vec<u32> = Vec::new();
+
+                            let mut keys_written = 0;
+
+                            let mut current: Option<LookupEntry<'_>> = None;
+
+                            #[derive(Default)]
+                            struct Collector<'l> {
+                                entries: Vec<LookupEntry<'l>>,
+                                total_key_size: usize,
+                                total_value_size: usize,
+                                last_entries: Vec<LookupEntry<'l>>,
+                                last_entries_total_key_size: usize,
+                                new_sst_files:
+                                    Vec<(u32, File, StaticSortedFileBuilderMeta<'static>)>,
+                            }
+                            let mut used_collector = Collector::default();
+                            let mut unused_collector = Collector::default();
+                            let family_config = &self.config.family_configs[family as usize];
+
+                            // Track a deleted key and the seq number of the
+                            // tombstone's SST. During compaction we drop the
+                            // tombstone itself and any entries for the same key
+                            // from SSTs that are older (lower seq) than the
+                            // tombstone.
+                            struct DeletedKey {
+                                key: ArcSlice<u8>,
+                                seq: u32,
+                            }
+                            let mut deleted_key: Option<DeletedKey> = None;
+
+                            /// Check if an entry should be dropped during
+                            /// compaction because it is a tombstone or is
+                            /// shadowed by one.
+                            fn should_drop(
+                                entry: &LookupEntry<'_>,
+                                deleted_key: &mut Option<DeletedKey>,
+                                can_drop_tombstones: bool,
+                                order_to_seq: &[u32],
+                            ) -> bool {
+                                if !can_drop_tombstones {
+                                    return false;
+                                }
+                                let entry_seq = order_to_seq[entry.order];
+                                if entry.value.is_deleted() {
+                                    *deleted_key = Some(DeletedKey {
+                                        key: entry.key.clone(),
+                                        seq: entry_seq,
                                     });
+                                    return true;
                                 }
-
-                                fn create_sst_file<'l, S: ParallelScheduler>(
-                                    parallel_scheduler: &S,
-                                    entries: &[LookupEntry<'l>],
-                                    total_key_size: usize,
-                                    path: &Path,
-                                    seq: u32,
-                                    flags: MetaEntryFlags,
-                                ) -> Result<(u32, File, StaticSortedFileBuilderMeta<'static>)>
-                                {
-                                    let _span =
-                                        tracing::trace_span!("write merged sst file").entered();
-                                    let (meta, file) = parallel_scheduler.block_in_place(|| {
-                                        write_static_stored_file(
-                                            entries,
-                                            total_key_size,
-                                            &path.join(format!("{seq:08}.sst")),
-                                            flags,
-                                        )
-                                    })?;
-                                    Ok((seq, file, meta))
-                                }
-
-                                // Iterate all SST files
-                                let iters = indicies
-                                    .iter()
-                                    .map(|&index| {
-                                        let meta_index = ssts_with_ranges[index].meta_index;
-                                        let index_in_meta = ssts_with_ranges[index].index_in_meta;
-                                        let meta = &meta_files[meta_index];
-                                        meta.entry(index_in_meta)
-                                            .sst(meta)?
-                                            .iter(key_block_cache, value_block_cache)
-                                    })
-                                    .collect::<Result<Vec<_>>>()?;
-
-                                let iter = MergeIter::new(iters.into_iter())?;
-
-                                // TODO figure out how to delete blobs when they are no longer
-                                // referenced
-                                let blob_seq_numbers_to_delete: Vec<u32> = Vec::new();
-
-                                let mut keys_written = 0;
-
-                                let mut current: Option<LookupEntry<'_>> = None;
-
-                                #[derive(Default)]
-                                struct Collector<'l> {
-                                    entries: Vec<LookupEntry<'l>>,
-                                    total_key_size: usize,
-                                    total_value_size: usize,
-                                    last_entries: Vec<LookupEntry<'l>>,
-                                    last_entries_total_key_size: usize,
-                                    new_sst_files:
-                                        Vec<(u32, File, StaticSortedFileBuilderMeta<'static>)>,
-                                }
-                                let mut used_collector = Collector::default();
-                                let mut unused_collector = Collector::default();
-                                for entry in iter {
-                                    let entry = entry?;
-
-                                    // Remove duplicates
-                                    if let Some(current) = current.take() {
-                                        if current.key != entry.key {
-                                            let is_used =
-                                                used_key_hashes[family as usize].iter().any(
-                                                    |amqf| amqf.contains_fingerprint(current.hash),
-                                                );
-                                            let collector = if is_used {
-                                                &mut used_collector
-                                            } else {
-                                                &mut unused_collector
-                                            };
-                                            let key_size = current.key.len();
-                                            let value_size =
-                                                current.value.uncompressed_size_in_sst();
-                                            collector.total_key_size += key_size;
-                                            collector.total_value_size += value_size;
-
-                                            if collector.total_key_size + collector.total_value_size
-                                                > DATA_THRESHOLD_PER_COMPACTED_FILE
-                                                || collector.entries.len()
-                                                    >= MAX_ENTRIES_PER_COMPACTED_FILE
-                                            {
-                                                let selected_total_key_size =
-                                                    collector.last_entries_total_key_size;
-                                                swap(
-                                                    &mut collector.entries,
-                                                    &mut collector.last_entries,
-                                                );
-                                                collector.last_entries_total_key_size =
-                                                    collector.total_key_size - key_size;
-                                                collector.total_key_size = key_size;
-                                                collector.total_value_size = value_size;
-
-                                                if !collector.entries.is_empty() {
-                                                    let seq = sequence_number
-                                                        .fetch_add(1, Ordering::SeqCst)
-                                                        + 1;
-
-                                                    keys_written += collector.entries.len() as u64;
-
-                                                    let mut flags = MetaEntryFlags::default();
-                                                    flags.set_cold(!is_used);
-                                                    collector.new_sst_files.push(create_sst_file(
-                                                        &self.parallel_scheduler,
-                                                        &collector.entries,
-                                                        selected_total_key_size,
-                                                        path,
-                                                        seq,
-                                                        flags,
-                                                    )?);
-
-                                                    collector.entries.clear();
-                                                }
-                                            }
-
-                                            collector.entries.push(current);
-                                        } else {
-                                            // Override value
-                                            // TODO delete blob file
-                                        }
+                                if let Some(dk) = deleted_key {
+                                    if *dk.key == *entry.key {
+                                        // Drop only entries from SSTs that are
+                                        // older than (or same as) the tombstone
+                                        return entry_seq <= dk.seq;
                                     }
-                                    current = Some(entry);
+                                    // Moved past the deleted key — clear tracker
+                                    *deleted_key = None;
                                 }
-                                if let Some(entry) = current {
+                                false
+                            }
+
+                            // For MultiValue families, buffer same-key entries
+                            // so we can sort them by temporal order before
+                            // emitting. The merge iterator sorts by value bytes
+                            // (for dedup), but we want temporal order in the
+                            // output SST.
+                            let is_multi_value = family_config.kind == FamilyKind::MultiValue;
+                            let mut key_group: Vec<LookupEntry<'_>> = Vec::new();
+
+                            /// Flush buffered same-key entries into the
+                            /// collector, sorted by temporal order (newest
+                            /// first, i.e., ascending `order` since lower
+                            /// order = newer SST).
+                            fn flush_key_group<'a, S: ParallelScheduler>(
+                                key_group: &mut Vec<LookupEntry<'a>>,
+                                used_key_hashes: &[Vec<qfilter::Filter>],
+                                family: u32,
+                                used_collector: &mut Collector<'a>,
+                                unused_collector: &mut Collector<'a>,
+                                parallel_scheduler: &S,
+                                sequence_number: &AtomicU32,
+                                keys_written: &mut u64,
+                                path: &Path,
+                            ) -> Result<()> {
+                                if key_group.is_empty() {
+                                    return Ok(());
+                                }
+                                // Sort by order descending (higher order = newer
+                                // SST = should come first in output)
+                                key_group.sort_by_key(|e| std::cmp::Reverse(e.order));
+                                for entry in key_group.drain(..) {
                                     let is_used = used_key_hashes[family as usize]
                                         .iter()
                                         .any(|amqf| amqf.contains_fingerprint(entry.hash));
                                     let collector = if is_used {
-                                        &mut used_collector
+                                        &mut *used_collector
                                     } else {
-                                        &mut unused_collector
+                                        &mut *unused_collector
                                     };
+                                    let key_size = entry.key.len();
+                                    let value_size = entry.value.uncompressed_size_in_sst();
+                                    collector.total_key_size += key_size;
+                                    collector.total_value_size += value_size;
 
-                                    collector.total_key_size += entry.key.len();
-                                    // Obsolete as we no longer need total_value_size
-                                    // total_value_size += entry.value.uncompressed_size_in_sst();
+                                    if collector.total_key_size + collector.total_value_size
+                                        > DATA_THRESHOLD_PER_COMPACTED_FILE
+                                        || collector.entries.len() >= MAX_ENTRIES_PER_COMPACTED_FILE
+                                    {
+                                        let selected_total_key_size =
+                                            collector.last_entries_total_key_size;
+                                        swap(&mut collector.entries, &mut collector.last_entries);
+                                        collector.last_entries_total_key_size =
+                                            collector.total_key_size - key_size;
+                                        collector.total_key_size = key_size;
+                                        collector.total_value_size = value_size;
+
+                                        if !collector.entries.is_empty() {
+                                            let seq =
+                                                sequence_number.fetch_add(1, Ordering::SeqCst) + 1;
+
+                                            *keys_written += collector.entries.len() as u64;
+
+                                            let mut flags = MetaEntryFlags::default();
+                                            flags.set_cold(!is_used);
+                                            collector.new_sst_files.push(create_sst_file(
+                                                parallel_scheduler,
+                                                &collector.entries,
+                                                selected_total_key_size,
+                                                path,
+                                                seq,
+                                                flags,
+                                            )?);
+
+                                            collector.entries.clear();
+                                        }
+                                    }
+
                                     collector.entries.push(entry);
                                 }
+                                Ok(())
+                            }
 
-                                // If we have one set of entries left, write them to a new SST file
-                                for (collector, flags) in [
-                                    (&mut used_collector, MetaEntryFlags::WARM),
-                                    (&mut unused_collector, MetaEntryFlags::COLD),
-                                ] {
-                                    if collector.last_entries.is_empty()
-                                        && !collector.entries.is_empty()
-                                    {
+                            /// Emit a single entry to the collector (used for
+                            /// SingleValue families).
+                            fn emit_entry<'a, S: ParallelScheduler>(
+                                entry: LookupEntry<'a>,
+                                used_key_hashes: &[Vec<qfilter::Filter>],
+                                family: u32,
+                                used_collector: &mut Collector<'a>,
+                                unused_collector: &mut Collector<'a>,
+                                parallel_scheduler: &S,
+                                sequence_number: &AtomicU32,
+                                keys_written: &mut u64,
+                                path: &Path,
+                            ) -> Result<()> {
+                                let is_used = used_key_hashes[family as usize]
+                                    .iter()
+                                    .any(|amqf| amqf.contains_fingerprint(entry.hash));
+                                let collector = if is_used {
+                                    &mut *used_collector
+                                } else {
+                                    &mut *unused_collector
+                                };
+                                let key_size = entry.key.len();
+                                let value_size = entry.value.uncompressed_size_in_sst();
+                                collector.total_key_size += key_size;
+                                collector.total_value_size += value_size;
+
+                                if collector.total_key_size + collector.total_value_size
+                                    > DATA_THRESHOLD_PER_COMPACTED_FILE
+                                    || collector.entries.len() >= MAX_ENTRIES_PER_COMPACTED_FILE
+                                {
+                                    let selected_total_key_size =
+                                        collector.last_entries_total_key_size;
+                                    swap(&mut collector.entries, &mut collector.last_entries);
+                                    collector.last_entries_total_key_size =
+                                        collector.total_key_size - key_size;
+                                    collector.total_key_size = key_size;
+                                    collector.total_value_size = value_size;
+
+                                    if !collector.entries.is_empty() {
                                         let seq =
                                             sequence_number.fetch_add(1, Ordering::SeqCst) + 1;
 
-                                        keys_written += collector.entries.len() as u64;
+                                        *keys_written += collector.entries.len() as u64;
+
+                                        let mut flags = MetaEntryFlags::default();
+                                        flags.set_cold(!is_used);
                                         collector.new_sst_files.push(create_sst_file(
-                                            &self.parallel_scheduler,
+                                            parallel_scheduler,
                                             &collector.entries,
-                                            collector.total_key_size,
+                                            selected_total_key_size,
                                             path,
                                             seq,
                                             flags,
                                         )?);
-                                    } else
-                                    // If we have two sets of entries left, merge them and
-                                    // split it into two SST files, to avoid having a
-                                    // single SST file that is very small.
-                                    if !collector.last_entries.is_empty() {
-                                        collector.last_entries.append(&mut collector.entries);
 
-                                        collector.last_entries_total_key_size +=
-                                            collector.total_key_size;
-
-                                        let (part1, part2) = collector
-                                            .last_entries
-                                            .split_at(collector.last_entries.len() / 2);
-
-                                        let seq1 =
-                                            sequence_number.fetch_add(1, Ordering::SeqCst) + 1;
-                                        let seq2 =
-                                            sequence_number.fetch_add(1, Ordering::SeqCst) + 1;
-
-                                        keys_written += part1.len() as u64;
-                                        collector.new_sst_files.push(create_sst_file(
-                                            &self.parallel_scheduler,
-                                            part1,
-                                            // We don't know the exact sizes so we estimate them
-                                            collector.last_entries_total_key_size / 2,
-                                            path,
-                                            seq1,
-                                            flags,
-                                        )?);
-
-                                        keys_written += part2.len() as u64;
-                                        collector.new_sst_files.push(create_sst_file(
-                                            &self.parallel_scheduler,
-                                            part2,
-                                            collector.last_entries_total_key_size / 2,
-                                            path,
-                                            seq2,
-                                            flags,
-                                        )?);
+                                        collector.entries.clear();
                                     }
                                 }
-                                let mut new_sst_files = take(&mut unused_collector.new_sst_files);
-                                new_sst_files.append(&mut used_collector.new_sst_files);
-                                Ok(PartialMergeResult::Merged {
-                                    new_sst_files,
-                                    blob_seq_numbers_to_delete,
-                                    keys_written,
-                                    indicies,
-                                })
-                            },
-                        )
+
+                                collector.entries.push(entry);
+                                Ok(())
+                            }
+
+                            for entry in iter {
+                                let entry = entry?;
+
+                                // Remove duplicates based on family's deduplication mode
+                                if let Some(current) = current.take() {
+                                    let is_duplicate = match family_config.kind {
+                                        FamilyKind::SingleValue => current.key == entry.key,
+                                        FamilyKind::MultiValue => {
+                                            current.key == entry.key
+                                                && current.value.eq_for_dedup(&entry.value)
+                                        }
+                                    };
+                                    if !is_duplicate {
+                                        // Drop deleted entries and entries sharing
+                                        // the deleted key
+                                        if !should_drop(
+                                            &current,
+                                            &mut deleted_key,
+                                            can_drop_tombstones,
+                                            &order_to_seq,
+                                        ) {
+                                            if is_multi_value {
+                                                // Buffer same-key entries for temporal
+                                                // re-ordering
+                                                let same_key = key_group
+                                                    .last()
+                                                    .is_some_and(|prev| *prev.key == *current.key);
+                                                if !same_key {
+                                                    // New key — flush previous group
+                                                    flush_key_group(
+                                                        &mut key_group,
+                                                        &used_key_hashes,
+                                                        family,
+                                                        &mut used_collector,
+                                                        &mut unused_collector,
+                                                        &self.parallel_scheduler,
+                                                        sequence_number,
+                                                        &mut keys_written,
+                                                        path,
+                                                    )?;
+                                                }
+                                                key_group.push(current);
+                                            } else {
+                                                emit_entry(
+                                                    current,
+                                                    &used_key_hashes,
+                                                    family,
+                                                    &mut used_collector,
+                                                    &mut unused_collector,
+                                                    &self.parallel_scheduler,
+                                                    sequence_number,
+                                                    &mut keys_written,
+                                                    path,
+                                                )?;
+                                            }
+                                        }
+                                    } else {
+                                        // Override value
+                                        // TODO delete blob file
+                                    }
+                                }
+                                current = Some(entry);
+                            }
+                            // Emit the final entry (skip if deleted or belongs
+                            // to a deleted key)
+                            if let Some(entry) = current.filter(|e| {
+                                !should_drop(
+                                    e,
+                                    &mut deleted_key,
+                                    can_drop_tombstones,
+                                    &order_to_seq,
+                                )
+                            }) {
+                                if is_multi_value {
+                                    let same_key = key_group
+                                        .last()
+                                        .is_some_and(|prev| *prev.key == *entry.key);
+                                    if !same_key {
+                                        flush_key_group(
+                                            &mut key_group,
+                                            &used_key_hashes,
+                                            family,
+                                            &mut used_collector,
+                                            &mut unused_collector,
+                                            &self.parallel_scheduler,
+                                            sequence_number,
+                                            &mut keys_written,
+                                            path,
+                                        )?;
+                                    }
+                                    key_group.push(entry);
+                                    flush_key_group(
+                                        &mut key_group,
+                                        &used_key_hashes,
+                                        family,
+                                        &mut used_collector,
+                                        &mut unused_collector,
+                                        &self.parallel_scheduler,
+                                        sequence_number,
+                                        &mut keys_written,
+                                        path,
+                                    )?;
+                                } else {
+                                    emit_entry(
+                                        entry,
+                                        &used_key_hashes,
+                                        family,
+                                        &mut used_collector,
+                                        &mut unused_collector,
+                                        &self.parallel_scheduler,
+                                        sequence_number,
+                                        &mut keys_written,
+                                        path,
+                                    )?;
+                                }
+                            }
+
+                            // If we have one set of entries left, write them to a new SST file
+                            for (collector, flags) in [
+                                (&mut used_collector, MetaEntryFlags::WARM),
+                                (&mut unused_collector, MetaEntryFlags::COLD),
+                            ] {
+                                if collector.last_entries.is_empty()
+                                    && !collector.entries.is_empty()
+                                {
+                                    let seq = sequence_number.fetch_add(1, Ordering::SeqCst) + 1;
+
+                                    keys_written += collector.entries.len() as u64;
+                                    collector.new_sst_files.push(create_sst_file(
+                                        &self.parallel_scheduler,
+                                        &collector.entries,
+                                        collector.total_key_size,
+                                        path,
+                                        seq,
+                                        flags,
+                                    )?);
+                                } else
+                                // If we have two sets of entries left, merge them and
+                                // split it into two SST files, to avoid having a
+                                // single SST file that is very small.
+                                if !collector.last_entries.is_empty() {
+                                    collector.last_entries.append(&mut collector.entries);
+
+                                    collector.last_entries_total_key_size +=
+                                        collector.total_key_size;
+
+                                    let (part1, part2) = collector
+                                        .last_entries
+                                        .split_at(collector.last_entries.len() / 2);
+
+                                    let seq1 = sequence_number.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let seq2 = sequence_number.fetch_add(1, Ordering::SeqCst) + 1;
+
+                                    keys_written += part1.len() as u64;
+                                    collector.new_sst_files.push(create_sst_file(
+                                        &self.parallel_scheduler,
+                                        part1,
+                                        // We don't know the exact sizes so we estimate them
+                                        collector.last_entries_total_key_size / 2,
+                                        path,
+                                        seq1,
+                                        flags,
+                                    )?);
+
+                                    keys_written += part2.len() as u64;
+                                    collector.new_sst_files.push(create_sst_file(
+                                        &self.parallel_scheduler,
+                                        part2,
+                                        collector.last_entries_total_key_size / 2,
+                                        path,
+                                        seq2,
+                                        flags,
+                                    )?);
+                                }
+                            }
+                            let mut new_sst_files = take(&mut unused_collector.new_sst_files);
+                            new_sst_files.append(&mut used_collector.new_sst_files);
+                            Ok(PartialMergeResult::Merged {
+                                new_sst_files,
+                                blob_seq_numbers_to_delete,
+                                keys_written,
+                                indices,
+                            })
+                        })
                         .with_context(|| {
                             format!("Failed to merge database files for family {family}")
                         })?;
@@ -1222,7 +1477,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                             if let PartialMergeResult::Merged {
                                 new_sst_files,
                                 blob_seq_numbers_to_delete,
-                                indicies: _,
+                                indices: _,
                                 keys_written: _,
                             } = r
                             {
@@ -1253,14 +1508,14 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                                     new_sst_files: merged_new_sst_files,
                                     blob_seq_numbers_to_delete: merged_blob_seq_numbers_to_delete,
                                     keys_written: merged_keys_written,
-                                    indicies,
+                                    indices,
                                 } => {
                                     writeln!(
                                         log,
                                         "{family:3} | {meta_seq:08} | MERGE \
                                          ({merged_keys_written} keys):"
                                     )?;
-                                    for i in indicies.iter() {
+                                    for i in indices.iter() {
                                         let seq = ssts_with_ranges[*i].seq;
                                         let (min, max) = ssts_with_ranges[*i].range().into_inner();
                                         writeln!(
@@ -1348,16 +1603,122 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
     /// might hold onto a block of the database and it should not be hold long-term.
     pub fn get<K: QueryKey>(&self, family: usize, key: &K) -> Result<Option<ArcSlice<u8>>> {
         debug_assert!(family < FAMILIES, "Family index out of bounds");
+        if self.config.family_configs[family].kind != FamilyKind::SingleValue {
+            // This is an error in our caller so just panic
+            panic!(
+                "only single valued tables can be queried with `get', call `get_multiple` instead"
+            )
+        }
         let span = tracing::trace_span!(
             "database read",
             name = family,
             result_size = tracing::field::Empty
         )
         .entered();
+        let results = self.get_impl::<K, false>(family, key, &span)?;
+        debug_assert!(results.len() <= 1, "get() should return at most one result");
+        match results.into_iter().next() {
+            Some(value) => {
+                span.record("result_size", value.len());
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Looks up a key and returns all matching values.
+    ///
+    /// This is useful for keyspaces where keys are not unique and collisions are possible.
+    /// Unlike `get`, which returns only the first match, this method returns all
+    /// entries with the same key from all SST files.  By default however we assume these collisions
+    /// are extremely rare and thus optimize for there being exactly 0 or 1 results.
+    ///
+    /// The order of returned values is undefined. Callers must not rely on any particular
+    /// ordering (neither insertion order nor byte order).
+    pub fn get_multiple<K: QueryKey>(
+        &self,
+        family: usize,
+        key: &K,
+    ) -> Result<SmallVec<[ArcSlice<u8>; 1]>> {
+        debug_assert!(family < FAMILIES, "Family index out of bounds");
+        if self.config.family_configs[family].kind != FamilyKind::MultiValue {
+            // This is an error in our caller so just panic
+            panic!("only multi-valued ables can be queried with `get_multiple'")
+        }
+        let span = tracing::trace_span!(
+            "database read multiple",
+            name = family,
+            result_count = tracing::field::Empty,
+            result_size = tracing::field::Empty
+        )
+        .entered();
+        let results = self.get_impl::<K, true>(family, key, &span)?;
+        span.record("result_count", results.len());
+        span.record(
+            "result_size",
+            results.iter().map(|r| r.len()).sum::<usize>(),
+        );
+        Ok(results)
+    }
+
+    /// Shared implementation for `get` and `get_multiple`.
+    ///
+    /// If `FIND_ALL` is false, stops after finding the first match.
+    /// If `FIND_ALL` is true, continues to find all matches across all meta files.
+    /// Deduplicates a list of values, preserving insertion order (first occurrence wins).
+    /// Optimized for small sets: uses O(N^2) comparison for N <= 8, HashSet for larger N.
+    fn dedup_output(output: &mut SmallVec<[ArcSlice<u8>; 1]>) {
+        let len = output.len();
+        if len <= 1 {
+            return;
+        }
+        if len <= 8 {
+            // O(N^2) scan: for each element, check if any earlier element has the same bytes
+            let mut write = 1;
+            for read in 1..len {
+                let is_dup = output[..write]
+                    .iter()
+                    .any(|prev| prev.as_ref() == output[read].as_ref());
+                if !is_dup {
+                    if write != read {
+                        output.swap(write, read);
+                    }
+                    write += 1;
+                }
+            }
+            output.truncate(write);
+        } else {
+            // Use a HashSet for larger sets
+            let mut seen = HashSet::with_capacity(len);
+            let mut write = 0;
+            for read in 0..len {
+                if seen.insert(output[read].as_ref().to_vec()) {
+                    if write != read {
+                        output.swap(write, read);
+                    }
+                    write += 1;
+                }
+            }
+            output.truncate(write);
+        }
+    }
+
+    fn get_impl<K: QueryKey, const FIND_ALL: bool>(
+        &self,
+        family: usize,
+        key: &K,
+        span: &EnteredSpan,
+    ) -> Result<SmallVec<[ArcSlice<u8>; 1]>> {
         let hash = hash_key(key);
         let inner = self.inner.read();
+        let mut output: SmallVec<[ArcSlice<u8>; 1]> = SmallVec::new();
+        // Track whether we found the key in any SST (even if deleted).
+        // Used for miss_global stat: only fires if key was never found anywhere.
+        #[cfg(feature = "stats")]
+        let mut found_in_sst = false;
+
         for meta in inner.meta_files.iter().rev() {
-            match meta.lookup(
+            match meta.lookup::<K, FIND_ALL>(
                 family as u32,
                 hash,
                 key,
@@ -1377,28 +1738,51 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                     self.stats.miss_amqf.fetch_add(1, Ordering::Relaxed);
                 }
                 MetaLookupResult::SstLookup(result) => match result {
-                    SstLookupResult::Found(result) => {
+                    SstLookupResult::Found(values) => {
+                        #[cfg(feature = "stats")]
+                        {
+                            found_in_sst = true;
+                        }
                         inner.accessed_key_hashes[family].insert(hash);
-                        match result {
-                            LookupValue::Deleted => {
-                                #[cfg(feature = "stats")]
-                                self.stats.hits_deleted.fetch_add(1, Ordering::Relaxed);
-                                span.record("result_size", "deleted");
-                                return Ok(None);
+                        let mut found_deleted = false;
+                        for value in values {
+                            match value {
+                                LookupValue::Deleted => {
+                                    #[cfg(feature = "stats")]
+                                    self.stats.hits_deleted.fetch_add(1, Ordering::Relaxed);
+                                    span.record("result_size", "deleted");
+                                    if !FIND_ALL {
+                                        // For get, deleted means "key was deleted", stop
+                                        // looking
+                                        return Ok(SmallVec::new());
+                                    }
+                                    // For get_multiple, a tombstone means we should stop
+                                    // looking at older meta files but keep values already
+                                    // collected from newer layers.
+                                    found_deleted = true;
+                                }
+                                LookupValue::Slice { value } => {
+                                    #[cfg(feature = "stats")]
+                                    self.stats.hits_small.fetch_add(1, Ordering::Relaxed);
+                                    output.push(value);
+                                }
+                                LookupValue::Blob { sequence_number } => {
+                                    #[cfg(feature = "stats")]
+                                    self.stats.hits_blob.fetch_add(1, Ordering::Relaxed);
+                                    let blob = self.read_blob(sequence_number)?;
+                                    output.push(blob);
+                                }
                             }
-                            LookupValue::Slice { value } => {
-                                #[cfg(feature = "stats")]
-                                self.stats.hits_small.fetch_add(1, Ordering::Relaxed);
-                                span.record("result_size", value.len());
-                                return Ok(Some(value));
-                            }
-                            LookupValue::Blob { sequence_number } => {
-                                #[cfg(feature = "stats")]
-                                self.stats.hits_blob.fetch_add(1, Ordering::Relaxed);
-                                let blob = self.read_blob(sequence_number)?;
-                                span.record("result_size", blob.len());
-                                return Ok(Some(blob));
-                            }
+                        }
+                        if found_deleted {
+                            // Stop looking at older layers — the delete covers
+                            // everything below
+                            Self::dedup_output(&mut output);
+                            return Ok(output);
+                        }
+                        if !FIND_ALL {
+                            // For get, we found a non-deleted value, return it
+                            return Ok(output);
                         }
                     }
                     SstLookupResult::NotFound => {
@@ -1408,10 +1792,16 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                 },
             }
         }
+
         #[cfg(feature = "stats")]
-        self.stats.miss_global.fetch_add(1, Ordering::Relaxed);
-        span.record("result_size", "not found");
-        Ok(None)
+        if !found_in_sst {
+            self.stats.miss_global.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if FIND_ALL {
+            Self::dedup_output(&mut output);
+        }
+        Ok(output)
     }
 
     pub fn batch_get<K: QueryKey>(
@@ -1420,6 +1810,10 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
         keys: &[K],
     ) -> Result<Vec<Option<ArcSlice<u8>>>> {
         debug_assert!(family < FAMILIES, "Family index out of bounds");
+        if self.config.family_configs[family].kind != FamilyKind::SingleValue {
+            // This is an error in our caller so just panic
+            panic!("only single valued tables can be queried with `batch_get'")
+        }
         let span = tracing::trace_span!(
             "database batch read",
             name = family,

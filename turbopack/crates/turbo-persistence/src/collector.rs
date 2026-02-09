@@ -1,7 +1,7 @@
 use std::mem::take;
 
 use crate::{
-    ValueBuffer,
+    FamilyKind, ValueBuffer,
     collector_entry::{CollectorEntry, CollectorEntryValue, EntryKey, TINY_VALUE_THRESHOLD},
     constants::{
         DATA_THRESHOLD_PER_INITIAL_FILE, MAX_ENTRIES_PER_INITIAL_FILE, MAX_SMALL_VALUE_SIZE,
@@ -100,11 +100,86 @@ impl<K: StoreKey, const SIZE_SHIFT: usize> Collector<K, SIZE_SHIFT> {
         self.entries.push(entry);
     }
 
-    /// Sorts the entries and returns them along with the total key size. This doesn't
-    /// clear the entries.
-    pub fn sorted(&mut self) -> (&[CollectorEntry<K>], usize) {
-        self.entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    /// Sorts and deduplicates entries according to the family kind, returning the entries
+    /// in (key, value) order suitable for SST storage.
+    ///
+    /// For `SingleValue`: only the last entry per key is kept (latest write wins).
+    /// For `MultiValue`: deletes discard all prior entries for that key within this batch,
+    /// but the tombstone itself is kept to shadow older SSTs. Duplicate values are also removed.
+    pub fn sorted(&mut self, kind: FamilyKind) -> (&[CollectorEntry<K>], usize) {
+        match kind {
+            FamilyKind::SingleValue => {
+                // Stable sort by key — preserves insertion order for entries with the same key
+                self.entries.sort_by(|a, b| a.key.cmp(&b.key));
+                // Keep only the last entry per key (latest write wins).
+                // After this, there's exactly one entry per key so the order is already
+                // fully determined by key alone — no need to re-sort by (key, value).
+                self.entries.dedup_by(|a, b| {
+                    if a.key == b.key {
+                        std::mem::swap(a, b);
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            FamilyKind::MultiValue => {
+                // Stable sort by key — preserves insertion order so we can find the
+                // last Deleted tombstone per key group.
+                self.entries.sort_by(|a, b| a.key.cmp(&b.key));
+                // If any Deleted tombstones exist, prune entries before the last
+                // tombstone within each key group. Tombstones are rare.
+                self.prune_deleted_groups();
+                // Re-sort by (key, value) for SST storage and dedup identical pairs.
+                // Data is already sorted by key, so only values within key groups need
+                // reordering. Using stable sort (timsort) which is O(n) on nearly-sorted
+                // data since it detects and merges existing sorted runs.
+                self.entries.sort();
+                self.entries.dedup();
+            }
+        }
+
+        self.recalculate_sizes();
         (&self.entries, self.total_key_size)
+    }
+
+    /// For MultiValue families: within each key group (stably sorted by key, preserving
+    /// insertion order), if a Deleted tombstone is present, discard all entries before the
+    /// last tombstone. The tombstone itself plus any entries after it survive.
+    ///
+    /// Tombstones are rare, so we scan for them directly rather than iterating every group.
+    fn prune_deleted_groups(&mut self) {
+        let mut i = self.entries.len();
+        while i > 0 {
+            // Find the last Deleted entry in entries[..i]
+            let Some(del_pos) = self.entries[..i]
+                .iter()
+                .rposition(|e| matches!(e.value, CollectorEntryValue::Deleted))
+            else {
+                break;
+            };
+
+            // Scan backwards to find the start of this key group
+            let key = &self.entries[del_pos].key;
+            let mut group_start = del_pos;
+            while group_start > 0 && self.entries[group_start - 1].key == *key {
+                group_start -= 1;
+            }
+
+            // Remove entries before the tombstone (group_start..del_pos)
+            self.entries.drain(group_start..del_pos);
+            i = group_start;
+        }
+    }
+
+    /// Recalculates total_key_size and total_value_size from entries.
+    fn recalculate_sizes(&mut self) {
+        self.total_key_size = 0;
+        self.total_value_size = 0;
+        for entry in &self.entries {
+            self.total_key_size += entry.key.len();
+            self.total_value_size += entry.value.len();
+        }
     }
 
     /// Clears the collector.

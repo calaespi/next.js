@@ -1,5 +1,8 @@
+use std::cmp::Ordering;
+
 use crate::{
     ArcSlice,
+    collector_entry::{ValueCategory, cmp_value_category},
     constants::{MAX_INLINE_VALUE_SIZE, MAX_SMALL_VALUE_SIZE},
     static_sorted_file_builder::{Entry, EntryValue},
 };
@@ -28,6 +31,11 @@ pub enum LazyLookupValue<'l> {
 }
 
 impl LazyLookupValue<'_> {
+    /// Returns true if this value is a deletion tombstone.
+    pub fn is_deleted(&self) -> bool {
+        matches!(self, LazyLookupValue::Eager(LookupValue::Deleted))
+    }
+
     /// Returns the size of the value in the SST file.
     pub fn uncompressed_size_in_sst(&self) -> usize {
         match self {
@@ -39,6 +47,40 @@ impl LazyLookupValue<'_> {
             } => *uncompressed_size as usize,
         }
     }
+
+    /// Returns true if two values are equal for deduplication purposes.
+    ///
+    /// For `Medium` values, compares the compressed block bytes directly
+    /// (assumes deterministic compression).
+    pub fn eq_for_dedup(&self, other: &Self) -> bool {
+        self.cmp_for_dedup(other) == Ordering::Equal
+    }
+
+    /// Classify this value for sort ordering purposes.
+    ///
+    /// For `Medium` (compressed) values, the compressed block bytes are used for comparison.
+    /// This is a proxy that provides a consistent total order, though cross-type comparisons
+    /// between `Slice` and `Medium` may not reflect semantic equality.
+    pub fn category(&self) -> ValueCategory<'_> {
+        match self {
+            LazyLookupValue::Eager(LookupValue::Deleted) => ValueCategory::Deleted,
+            LazyLookupValue::Eager(LookupValue::Slice { value }) => {
+                ValueCategory::ByteContent(value.as_ref())
+            }
+            LazyLookupValue::Medium { block, .. } => ValueCategory::ByteContent(block),
+            LazyLookupValue::Eager(LookupValue::Blob { sequence_number }) => {
+                ValueCategory::Blob(*sequence_number)
+            }
+        }
+    }
+
+    /// Compares two values for ordering purposes during merge sort.
+    ///
+    /// Uses the shared `cmp_value_category` to ensure the same total order as
+    /// `CollectorEntryValue::Ord`: `Deleted < ByteContent < Blob`.
+    pub fn cmp_for_dedup(&self, other: &Self) -> Ordering {
+        cmp_value_category(&self.category(), &other.category())
+    }
 }
 
 /// An entry from a SST file lookup.
@@ -49,6 +91,10 @@ pub struct LookupEntry<'l> {
     pub key: ArcSlice<u8>,
     /// The value.
     pub value: LazyLookupValue<'l>,
+    /// The source order of the SST this entry came from.
+    /// Lower values indicate newer SSTs. Only meaningful when returned from
+    /// a [`MergeIter`], defaults to 0 for entries from a single SST.
+    pub order: usize,
 }
 
 impl Entry for LookupEntry<'_> {
