@@ -214,6 +214,7 @@ export function createNextApiEsmAliases() {
     headers: 'next/dist/api/headers',
     og: 'next/dist/api/og',
     server: 'next/dist/api/server',
+    error: 'next/dist/api/error',
     // pages api
     document: 'next/dist/api/document',
     app: 'next/dist/api/app',
@@ -239,6 +240,7 @@ export function createAppRouterApiAliases(isServerOnlyLayer: boolean) {
   if (isServerOnlyLayer) {
     mapping['navigation'] = 'next/dist/api/navigation.react-server'
     mapping['link'] = 'next/dist/client/app-dir/link.react-server'
+    mapping['error'] = 'next/dist/api/error.react-server'
   }
 
   const aliasMap: Record<string, string> = {}
