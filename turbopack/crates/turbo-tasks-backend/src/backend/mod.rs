@@ -1081,8 +1081,24 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             }
         };
 
-        let preprocess = |task_id: TaskId, inner: &TaskStorage| {
-            if task_id.is_transient() {
+        type Snapshot = (
+            Option<TaskStorage>,
+            Option<TaskStorage>,
+            Option<Arc<CachedTaskType>>,
+        );
+
+        let preprocess = |task_id: TaskId, inner: &TaskStorage| -> Snapshot {
+            debug_assert!(
+                !task_id.is_transient(),
+                "transient tasks should never be mark modified"
+            );
+            // In a race it is possible that a task might get marked modified and we snapshot the
+            // database before it is fully connected.
+            debug_assert!(
+                inner.get_persistent_task_type().is_some(),
+                "task {task_id:?} in modified list should have persistent_task_type set"
+            );
+            if inner.get_persistent_task_type().is_none() {
                 return (None, None, None);
             }
 
@@ -1104,11 +1120,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
             (meta, data, task_type)
         };
         let process = |task_id: TaskId,
-                       (meta, data, task_type): (
-            Option<TaskStorage>,
-            Option<TaskStorage>,
-            Option<Arc<CachedTaskType>>,
-        ),
+                       (meta, data, task_type): Snapshot,
                        buffer: &mut TurboBincodeBuffer| {
             #[cfg(feature = "print_cache_item_size")]
             if let Some(ref m) = meta {
@@ -1132,7 +1144,17 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         let process_snapshot = |task_id: TaskId,
                                 inner: Box<TaskStorage>,
                                 buffer: &mut TurboBincodeBuffer| {
-            if task_id.is_transient() {
+            debug_assert!(
+                !task_id.is_transient(),
+                "transient tasks should never be snapshotted"
+            );
+            // In a race it is possible that a task might get marked modified and we snapshot the
+            // database before it is fully connected, just skip serializing it
+            debug_assert!(
+                inner.get_persistent_task_type().is_some(),
+                "task {task_id:?} in modified list should have persistent_task_type set"
+            );
+            if inner.get_persistent_task_type().is_none() {
                 return SnapshotItem {
                     task_id,
                     meta: None,

@@ -740,6 +740,19 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
         new_value
     }
 
+    /// Initialize a new persistent task with the given task type.
+    ///
+    /// This sets the persistent task type, marks it as new, sets restored flags,
+    /// and tracks modifications for both data and meta categories.
+    fn init_persistent_task(&mut self, task_type: Arc<CachedTaskType>) {
+        self.typed_mut().init_new_persistent_task(task_type);
+        // Now persistent_task_type is set, so track_modification will succeed and we need to mark
+        // both categories as modified since 1. they may have already been modified while tracking
+        // was disabled 2. this is a new task so we will want to write out both categories anyway.
+        self.track_modification(SpecificTaskDataCategory::Data, "init_persistent_task");
+        self.track_modification(SpecificTaskDataCategory::Meta, "init_persistent_task");
+    }
+
     fn invalidate_serialization(&mut self);
     /// Determine which tasks to prefetch for a task.
     /// Only returns Some once per task.

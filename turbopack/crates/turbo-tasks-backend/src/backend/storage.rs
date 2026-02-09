@@ -158,7 +158,7 @@ impl Storage {
         }
 
         // Ideally these shards would be perfectly aligned with the dashmap so we could
-        // monolithically lock shards instead of axquiring a lock for each item.  But doing this
+        // monolithically lock shards instead of acquiring a lock for each item.  But doing this
         // would be pretty expensive.  If somehow lock acquisition costs become large we could
         // revisit.
 
@@ -361,6 +361,11 @@ impl StorageWriteGuard<'_> {
         category: SpecificTaskDataCategory,
         #[cfg(feature = "trace_task_modification")] name: &str,
     ) {
+        // Don't track modifications on uninitialized persistent tasks.
+        // They'll be properly marked modified when init_persistent_task is called.
+        if self.inner.get_persistent_task_type().is_none() {
+            return;
+        }
         let flags = &self.inner.flags;
         if flags.is_snapshot(category) {
             return;
