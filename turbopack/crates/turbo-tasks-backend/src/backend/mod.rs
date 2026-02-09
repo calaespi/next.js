@@ -1092,8 +1092,25 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                 !task_id.is_transient(),
                 "transient tasks should never be mark modified"
             );
-            // In a race it is possible that a task might get marked modified and we snapshot the
-            // database before it is fully connected.
+            // Race condition: A new persistent task's ID is inserted into task_cache
+            // before its persistent_task_type is set (these are two separate DashMaps
+            // that can't be atomically mutated together). During this window, other
+            // operations (e.g., UpdateAggregationNumber) can access and modify the task,
+            // which would normally trigger track_modification and add it to the modified
+            // list — but without a persistent_task_type, the task can't be meaningfully
+            // serialized.
+            //
+            // Primary mitigation: track_modification_internal (storage.rs) skips tracking
+            // for tasks where persistent_task_type is None, preventing them from entering
+            // the modified list in the first place.
+            //
+            // This filter is a safety net for any remaining edge cases. If a task without
+            // persistent_task_type does end up here, skipping it means its data won't be
+            // persisted. On the next session, other tasks that referenced this task's ID
+            // (e.g., in their children or dependency sets) will hold a "ghost" reference
+            // to a task with no DB entry. The ghost gets an empty TaskStorage on restore,
+            // sits inert (no activeness, no dirty flag), and is cleaned up when the
+            // referencing task re-executes and recomputes its outward edges.
             debug_assert!(
                 inner.get_persistent_task_type().is_some(),
                 "task {task_id:?} in modified list should have persistent_task_type set"
@@ -1148,8 +1165,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                 !task_id.is_transient(),
                 "transient tasks should never be snapshotted"
             );
-            // In a race it is possible that a task might get marked modified and we snapshot the
-            // database before it is fully connected, just skip serializing it
+            // Safety net for uninitialized tasks — see detailed comment in `preprocess` above.
             debug_assert!(
                 inner.get_persistent_task_type().is_some(),
                 "task {task_id:?} in modified list should have persistent_task_type set"

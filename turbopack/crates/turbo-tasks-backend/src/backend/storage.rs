@@ -361,8 +361,10 @@ impl StorageWriteGuard<'_> {
         category: SpecificTaskDataCategory,
         #[cfg(feature = "trace_task_modification")] name: &str,
     ) {
-        // Don't track modifications on uninitialized persistent tasks.
-        // They'll be properly marked modified when init_persistent_task is called.
+        // Skip tracking for uninitialized persistent tasks (persistent_task_type not yet set).
+        // This can happen due to the race between task_cache insertion and initialization —
+        // see the detailed comment in mod.rs snapshot `preprocess` closure.
+        // The task will be properly marked modified when init_persistent_task is called.
         if self.inner.get_persistent_task_type().is_none() {
             return;
         }
