@@ -139,6 +139,14 @@ async function createErrorSnapshot(
 
     focusedSource = focusedSource.trim()
 
+    // Normalize non-deterministic pnpm store paths e.g.
+    // "./node_modules/.pnpm/next@file+..+hash/node_modules/next/dist/..." →
+    // "./node_modules/next/dist/..."
+    focusedSource = focusedSource.replace(
+      /\.\/node_modules\/\.pnpm\/[^/]+\/node_modules\//g,
+      './node_modules/'
+    )
+
     if (next !== null) {
       focusedSource = focusedSource.replaceAll(
         next.testDir,
