@@ -1080,156 +1080,117 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
                 }
             }
         };
+        // Helper to encode a TaskStorage into a SnapshotItem
+        // encode_meta/encode_data control whether to encode each category
+        let encode_snapshot_item =
+            |task_id: TaskId,
+             inner: &TaskStorage,
+             encode_meta: bool,
+             encode_data: bool,
+             buffer: &mut TurboBincodeBuffer| {
+                debug_assert!(
+                    !task_id.is_transient(),
+                    "transient tasks should never be mark modified"
+                );
+                // Race condition: A new persistent task's ID is inserted into task_cache
+                // before its persistent_task_type is set (these are two separate DashMaps
+                // that can't be atomically mutated together). During this window, other
+                // operations (e.g., UpdateAggregationNumber) can access and modify the task,
+                // which would normally trigger track_modification and add it to the modified
+                // list — but without a persistent_task_type, the task can't be meaningfully
+                // serialized.
+                //
+                // Primary mitigation: track_modification_internal (storage.rs) skips tracking
+                // for tasks where persistent_task_type is None, preventing them from entering
+                // the modified list in the first place.
+                //
+                // This filter is a safety net for any remaining edge cases. If a task without
+                // persistent_task_type does end up here, skipping it means its data won't be
+                // persisted. On the next session, other tasks that referenced this task's ID
+                // (e.g., in their children or dependency sets) will hold a "ghost" reference
+                // to a task with no DB entry. The ghost gets an empty TaskStorage on restore,
+                // sits inert (no activeness, no dirty flag), and is cleaned up when the
+                // referencing task re-executes and recomputes its outward edges.
+                debug_assert!(
+                    inner.get_persistent_task_type().is_some(),
+                    "task {task_id:?} in modified list should have persistent_task_type set"
+                );
+                if inner.get_persistent_task_type().is_none() {
+                    return SnapshotItem {
+                        task_id,
+                        meta: None,
+                        data: None,
+                        task_type: None,
+                    };
+                }
+                #[cfg(feature = "print_cache_item_size")]
+                if encode_meta {
+                    task_cache_stats
+                        .lock()
+                        .entry(self.debug_get_task_name(task_id))
+                        .or_default()
+                        .add_counts(inner);
+                }
 
-        type Snapshot = (
-            Option<TaskStorage>,
-            Option<TaskStorage>,
-            Option<Arc<CachedTaskType>>,
-        );
+                // Encode meta directly from TaskStorage reference (no clone needed)
+                let meta = encode_meta
+                    .then(|| {
+                        encode_category(task_id, inner, SpecificTaskDataCategory::Meta, buffer)
+                    })
+                    .flatten();
 
-        let preprocess = |task_id: TaskId, inner: &TaskStorage| -> Snapshot {
-            debug_assert!(
-                !task_id.is_transient(),
-                "transient tasks should never be mark modified"
-            );
-            // Race condition: A new persistent task's ID is inserted into task_cache
-            // before its persistent_task_type is set (these are two separate DashMaps
-            // that can't be atomically mutated together). During this window, other
-            // operations (e.g., UpdateAggregationNumber) can access and modify the task,
-            // which would normally trigger track_modification and add it to the modified
-            // list — but without a persistent_task_type, the task can't be meaningfully
-            // serialized.
-            //
-            // Primary mitigation: track_modification_internal (storage.rs) skips tracking
-            // for tasks where persistent_task_type is None, preventing them from entering
-            // the modified list in the first place.
-            //
-            // This filter is a safety net for any remaining edge cases. If a task without
-            // persistent_task_type does end up here, skipping it means its data won't be
-            // persisted. On the next session, other tasks that referenced this task's ID
-            // (e.g., in their children or dependency sets) will hold a "ghost" reference
-            // to a task with no DB entry. The ghost gets an empty TaskStorage on restore,
-            // sits inert (no activeness, no dirty flag), and is cleaned up when the
-            // referencing task re-executes and recomputes its outward edges.
-            debug_assert!(
-                inner.get_persistent_task_type().is_some(),
-                "task {task_id:?} in modified list should have persistent_task_type set"
-            );
-            if inner.get_persistent_task_type().is_none() {
-                return (None, None, None);
-            }
+                // Encode data directly from TaskStorage reference (no clone needed)
+                let data = encode_data
+                    .then(|| {
+                        encode_category(task_id, inner, SpecificTaskDataCategory::Data, buffer)
+                    })
+                    .flatten();
 
-            let meta_restored = inner.flags.meta_restored();
-            let data_restored = inner.flags.data_restored();
+                // Capture task type if this is a new task that needs cache persistence
+                let task_type = inner
+                    .flags
+                    .new_persistent_task()
+                    .then(|| inner.get_persistent_task_type().unwrap().clone());
 
-            // Encode meta/data directly from TaskStorage
-            let meta = meta_restored.then(|| inner.clone_meta_snapshot());
-            let data = data_restored.then(|| inner.clone_data_snapshot());
-
-            // Capture task type if this is a new task that needs cache persistence
-            let task_type = inner.flags.new_persistent_task().then(|| {
-                inner
-                    .get_persistent_task_type()
-                    .expect("new tasks must have a persistent_task_type")
-                    .clone()
-            });
-
-            (meta, data, task_type)
-        };
-        let process = |task_id: TaskId,
-                       (meta, data, task_type): Snapshot,
-                       buffer: &mut TurboBincodeBuffer| {
-            #[cfg(feature = "print_cache_item_size")]
-            if let Some(ref m) = meta {
-                task_cache_stats
-                    .lock()
-                    .entry(self.debug_get_task_name(task_id))
-                    .or_default()
-                    .add_counts(m);
-            }
-            let meta = meta
-                .and_then(|d| encode_category(task_id, &d, SpecificTaskDataCategory::Meta, buffer));
-            let data = data
-                .and_then(|d| encode_category(task_id, &d, SpecificTaskDataCategory::Data, buffer));
-            SnapshotItem {
-                task_id,
-                meta,
-                data,
-                task_type,
-            }
-        };
-        let process_snapshot = |task_id: TaskId,
-                                inner: Box<TaskStorage>,
-                                buffer: &mut TurboBincodeBuffer| {
-            debug_assert!(
-                !task_id.is_transient(),
-                "transient tasks should never be snapshotted"
-            );
-            // Safety net for uninitialized tasks — see detailed comment in `preprocess` above.
-            debug_assert!(
-                inner.get_persistent_task_type().is_some(),
-                "task {task_id:?} in modified list should have persistent_task_type set"
-            );
-            if inner.get_persistent_task_type().is_none() {
-                return SnapshotItem {
+                SnapshotItem {
                     task_id,
-                    meta: None,
-                    data: None,
-                    task_type: None,
-                };
-            }
+                    meta,
+                    data,
+                    task_type,
+                }
+            };
 
-            #[cfg(feature = "print_cache_item_size")]
-            if inner.flags.meta_modified() {
-                task_cache_stats
-                    .lock()
-                    .entry(self.debug_get_task_name(task_id))
-                    .or_default()
-                    .add_counts(&inner);
-            }
-
-            // Capture task type if this is a new task (from snapshot's modified flags)
-            let task_type = inner.flags.new_persistent_task().then(|| {
-                inner
-                    .get_persistent_task_type()
-                    .expect(
-                        "new_persistent_task can only be set if there is a persistent_task_type",
-                    )
-                    .clone()
-            });
-
-            // Encode meta/data directly from TaskStorage snapshot
-            let meta = inner
-                .flags
-                .meta_modified()
-                .then(|| encode_category(task_id, &inner, SpecificTaskDataCategory::Meta, buffer))
-                .flatten();
-            let data = inner
-                .flags
-                .data_modified()
-                .then(|| encode_category(task_id, &inner, SpecificTaskDataCategory::Data, buffer))
-                .flatten();
-
-            SnapshotItem {
+        // Process tasks from the main storage map (uses restored flags)
+        let process = |task_id: TaskId, inner: &TaskStorage, buffer: &mut TurboBincodeBuffer| {
+            encode_snapshot_item(
                 task_id,
-                meta,
-                data,
-                task_type,
-            }
+                inner,
+                inner.flags.meta_restored(),
+                inner.flags.data_restored(),
+                buffer,
+            )
         };
 
-        let snapshot = self
-            .storage
-            .take_snapshot(&preprocess, &process, &process_snapshot);
+        // Process tasks that were accessed during snapshot mode (uses modified flags)
+        let process_snapshot =
+            |task_id: TaskId, inner: Box<TaskStorage>, buffer: &mut TurboBincodeBuffer| {
+                encode_snapshot_item(
+                    task_id,
+                    &inner,
+                    inner.flags.meta_modified(),
+                    inner.flags.data_modified(),
+                    buffer,
+                )
+            };
 
+        let snapshot = self.storage.take_snapshot(&process, &process_snapshot);
+
+        // We peak all the iterators to avoid calling into the persistence layer if everything is
+        // empty.
         let task_snapshots = snapshot
             .into_iter()
             .filter_map(|iter| {
-                let mut iter = iter
-                    .filter(|item| {
-                        item.meta.is_some() || item.data.is_some() || item.task_type.is_some()
-                    })
-                    .peekable();
+                let mut iter = iter.filter(|item| !item.is_empty()).peekable();
                 iter.peek().is_some().then_some(iter)
             })
             .collect::<Vec<_>>();

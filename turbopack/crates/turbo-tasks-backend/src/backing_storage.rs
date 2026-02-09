@@ -18,6 +18,12 @@ pub struct SnapshotItem {
     pub task_type: Option<Arc<CachedTaskType>>,
 }
 
+impl SnapshotItem {
+    pub fn is_empty(&self) -> bool {
+        self.meta.is_none() && self.data.is_none() && self.task_type.is_none()
+    }
+}
+
 /// Represents types accepted by [`TurboTasksBackend::new`]. Typically this is the value returned by
 /// [`default_backing_storage`] or [`noop_backing_storage`].
 ///
