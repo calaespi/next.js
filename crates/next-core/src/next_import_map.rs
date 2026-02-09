@@ -456,7 +456,7 @@ pub async fn get_next_edge_import_map(
             rcstr!("next/app") => rcstr!("next/dist/api/app"),
             rcstr!("next/document") => rcstr!("next/dist/api/document"),
             rcstr!("next/dynamic") => rcstr!("next/dist/api/dynamic"),
-            rcstr!("next/error") => rcstr!("next/dist/api/error"),
+            rcstr!("next/error") => rcstr!("next/dist/pages/_error"),
             rcstr!("next/form") => rcstr!("next/dist/api/form"),
             rcstr!("next/head") => rcstr!("next/dist/api/head"),
             rcstr!("next/headers") => rcstr!("next/dist/api/headers"),
@@ -993,7 +993,6 @@ async fn apply_vendored_react_aliases_server(
         alias.extend(fxindexmap! {
             rcstr!("next/navigation") => rcstr!("next/dist/api/navigation.react-server"),
             rcstr!("next/link") => rcstr!("next/dist/client/app-dir/link.react-server"),
-            rcstr!("next/error") => rcstr!("next/dist/api/error.react-server"),
         });
     }
 
@@ -1024,7 +1023,6 @@ async fn rsc_aliases(
         alias.extend(fxindexmap! {
             rcstr!("next/navigation") => rcstr!("next/dist/api/navigation.react-server"),
             rcstr!("next/link") => rcstr!("next/dist/client/app-dir/link.react-server"),
-            rcstr!("next/error") => rcstr!("next/dist/api/error.react-server"),
         });
     }
 
