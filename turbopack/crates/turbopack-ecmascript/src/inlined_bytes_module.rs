@@ -80,6 +80,7 @@ impl EcmascriptChunkPlaceable for InlinedBytesJsModule {
         _chunking_context: Vc<Box<dyn ChunkingContext>>,
         _module_graph: Vc<ModuleGraph>,
         _async_module_info: Option<Vc<AsyncModuleInfo>>,
+        _estimated: bool,
     ) -> Result<Vc<EcmascriptChunkItemContent>> {
         let this = self.await?;
         let content = this.source.content().file_content().await?;

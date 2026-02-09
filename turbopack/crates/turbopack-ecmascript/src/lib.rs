@@ -809,6 +809,7 @@ impl EcmascriptChunkPlaceable for EcmascriptModuleAsset {
         chunking_context: Vc<Box<dyn ChunkingContext>>,
         _module_graph: Vc<ModuleGraph>,
         async_module_info: Option<Vc<AsyncModuleInfo>>,
+        _estimated: bool,
     ) -> Result<Vc<EcmascriptChunkItemContent>> {
         let span = tracing::info_span!(
             "code generation",
