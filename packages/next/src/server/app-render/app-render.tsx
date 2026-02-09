@@ -256,7 +256,7 @@ function teeDebugChannelForSsrAndBrowser(debugChannel: DebugChannelPair): {
   if (readable instanceof ReadableStream) {
     const [ssrStream, browserStream] = readable.tee()
     return { ssrStream, browserChannel: { readable: browserStream } }
-  } else {
+  } else if (process.env.__NEXT_USE_NODE_STREAMS) {
     const { Readable } = require('node:stream') as typeof import('node:stream')
     // Node Readable: tee natively, convert browser branch to web for HMR
     const [ssrStream, browserNodeStream] = teeNodeReadable(readable)
@@ -264,6 +264,10 @@ function teeDebugChannelForSsrAndBrowser(debugChannel: DebugChannelPair): {
       browserNodeStream
     ) as ReadableStream<Uint8Array>
     return { ssrStream, browserChannel: { readable: browserStream } }
+  } else {
+    throw new Error(
+      'Debug channel readable is not a ReadableStream but node streams are not enabled, this is a bug in the Next.js codebase'
+    )
   }
 }
 
@@ -278,11 +282,15 @@ function debugChannelClientForBrowser(debugChannel: DebugChannelPair): {
   const readable = debugChannel.clientSide.readable
   if (readable instanceof ReadableStream) {
     return { readable }
-  } else {
+  } else if (process.env.__NEXT_USE_NODE_STREAMS) {
     const { Readable } = require('node:stream') as typeof import('node:stream')
     return {
       readable: Readable.toWeb(readable) as ReadableStream<Uint8Array>,
     }
+  } else {
+    throw new Error(
+      'Debug channel readable is not a ReadableStream but node streams are not enabled, this is a bug in the Next.js codebase'
+    )
   }
 }
 
