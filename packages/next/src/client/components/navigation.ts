@@ -299,3 +299,6 @@ export {
   RedirectType,
   unstable_rethrow,
 } from './navigation.react-server'
+
+export { catchError } from './catch-error'
+export type { ErrorInfo } from './error-boundary'

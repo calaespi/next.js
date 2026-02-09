@@ -11,6 +11,7 @@ export { notFound } from './not-found'
 export { forbidden } from './forbidden'
 export { unauthorized } from './unauthorized'
 export { unstable_rethrow } from './unstable-rethrow'
+export { catchError } from './catch-error.react-server'
 export { ReadonlyURLSearchParams }
 
 export const RedirectType = {

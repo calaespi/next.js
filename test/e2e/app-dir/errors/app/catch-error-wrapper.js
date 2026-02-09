@@ -1,6 +1,6 @@
 'use client'
 
-import { catchError } from 'next/error'
+import { catchError } from 'next/navigation'
 
 function ErrorFallback(props, { error, reset, retry }) {
   return (
