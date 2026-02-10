@@ -70,7 +70,7 @@ export class ErrorBoundaryHandler extends React.Component<
       throw error
     }
 
-    return { error }
+    return { error, componentStack: undefined, ownerStack: undefined }
   }
 
   static getDerivedStateFromProps(
